@@ -1,0 +1,29 @@
+
+name: pplug-env
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+      - torch==2.0.1
+      - torchvision==0.15.2
+      - torchaudio==2.0.2
+      - transformers==4.44.0
+      - datasets==2.21.0
+      - accelerate==0.33.0
+      - tokenizers==0.19.1
+      - sentencepiece==0.2.0
+      - tiktoken==0.7.0
+      - neo4j==5.14.0
+      - py2neo==2021.2.4
+      - tqdm==4.66.5
+      - numpy==1.23.1
+      - pandas==2.2.3
+      - scikit-learn==1.5.2
+      - evaluate==0.4.2
+      - rouge-score==0.1.2
+      - sacrebleu==2.4.3
+      - wandb==0.13.11
+      - psutil<6.0.0
+      - rank-bm25==0.2.2   # Added for embedding.py
