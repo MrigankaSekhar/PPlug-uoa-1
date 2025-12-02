@@ -63,4 +63,26 @@ else
     hf download BAAI/bge-small-en-v1.5 --local-dir "$MODEL_PATH" || { echo "❌ Download failed"; exit 1; }
 fi
 
+# ---------------- FlanT5-base Model ----------------
+echo "[2/3] Checking FlanT5-base model..."
+if [ -d "${MODEL_DIR}/FlanT5-base" ] && [ "$(ls -A ${MODEL_DIR}/FlanT5-base 2>/dev/null)" ]; then
+    echo "✅ FlanT5-base model already exists. Skipping download."
+else
+    echo "⬇ Downloading FlanT5-base model..."
+    mkdir -p "${MODEL_DIR}/FlanT5-base"
+    hf download google/flan-t5-base --local-dir "${MODEL_DIR}/FlanT5-base"
+fi
+
+
+# ---------------- FlanT5-small Model ----------------
+echo "[2/3] Checking FlanT5-small model..."
+if [ -d "${MODEL_DIR}/FlanT5-small" ] && [ "$(ls -A ${MODEL_DIR}/FlanT5-small 2>/dev/null)" ]; then
+    echo "✅ FlanT5-small model already exists. Skipping download."
+else
+    echo "⬇ Downloading FlanT5-small model..."
+    mkdir -p "${MODEL_DIR}/FlanT5-small"
+    hf download google/flan-t5-small --local-dir "${MODEL_DIR}/FlanT5-small"
+fi
+
+
 echo "=== All checks complete ==="

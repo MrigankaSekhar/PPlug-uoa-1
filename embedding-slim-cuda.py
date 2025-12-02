@@ -36,7 +36,7 @@ except Exception:
 # MODEL & TOKENIZER
 # -----------------------------
 # If you have the model locally, keep the local path; otherwise use "BAAI/bge-small-en-v1.5"
-MODEL_PATH = "./bge-small-en-v1.5"
+MODEL_PATH = "./bge-base-en-v1.5"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 model = AutoModel.from_pretrained(MODEL_PATH, torch_dtype=dtype).to(device).eval()

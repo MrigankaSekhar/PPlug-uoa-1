@@ -27,3 +27,4 @@ dependencies:
       - wandb==0.13.11
       - psutil<6.0.0
       - rank-bm25==0.2.2   # Added for embedding.py
+      - deepspeed==0.13.1
