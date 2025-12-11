@@ -1,0 +1,74 @@
+flowchart TD
+
+%% ---------------------------
+%% Folders / Sources (old layers)
+BGE["bge_emb folder - Precomputed BGE embeddings"]
+GRAPH["graph_emb folder - Precomputed graph embeddings"]
+RUNTIME["his_id from dataset - last N recent items"]
+
+%% Dataset (old)
+DATASET["PersonalDataset_profile.py - __getitem__"]
+
+%% Embedding Tables (old history lookup)
+HIS_TBL["his_train_emb_table / his_dev_emb_table - long-term history lookup"]
+GRAPH_TBL["graph_emb_table - graph lookup"]
+
+%% NEW: Session-Aware Transformer
+SESSION_ENC["session_encoder - Transformer short-term intent"]
+
+%% NEW: Instruction Token & Alignment
+INST_TOKEN["inst_token - learnable vector"]
+ALIGN_MLP["align_mlp / align_mlp_inst - dimension matching"]
+
+%% Embeddings in Model
+PROFILE_EMBS["profile_embs - long-term profile"]
+GRAPH_EMBS["graph_embs - graph relational signal"]
+SESSION_EMBS["session_embs - short-term intent"]
+
+TASK_EMBS["task_embs - query semantics"]
+
+%% Combined personalization vector (now includes new layers)
+COMBINED["combined_user_embs - concat profile, session, graph, inst_token"]
+
+%% NEW Fusion in Model
+CROSS_ATT["gated_cross_attention - MultiheadAttention plus Gate"]
+INJECT["Inject fused_task_embs into LLM special token positions"]
+
+%% LLM embeddings (old)
+LLM_EMBS["LLM input embeddings - Flan-T5"]
+
+%% ---------------------------
+%% Edges
+BGE --> HIS_TBL
+GRAPH --> GRAPH_TBL
+RUNTIME --> SESSION_ENC
+
+DATASET --> HIS_TBL
+DATASET --> GRAPH_TBL
+DATASET --> SESSION_ENC
+
+HIS_TBL --> PROFILE_EMBS
+GRAPH_TBL --> GRAPH_EMBS
+SESSION_ENC --> SESSION_EMBS
+
+INST_TOKEN --> COMBINED
+
+PROFILE_EMBS --> COMBINED
+SESSION_EMBS --> COMBINED
+GRAPH_EMBS --> COMBINED
+
+COMBINED --> ALIGN_MLP
+TASK_EMBS --> ALIGN_MLP
+
+ALIGN_MLP --> CROSS_ATT
+
+CROSS_ATT --> INJECT
+INJECT --> LLM_EMBS
+
+%% ---------------------------
+%% Styling: new slim additions in green
+style SESSION_ENC fill:#43a047,stroke:#2e7d32,stroke-width:2px,color:#ffffff
+style INST_TOKEN fill:#43a047,stroke:#2e7d32,stroke-width:2px,color:#ffffff
+style ALIGN_MLP fill:#43a047,stroke:#2e7d32,stroke-width:2px,color:#ffffff
+style CROSS_ATT fill:#43a047,stroke:#2e7d32,stroke-width:2px,color:#ffffff
+style INJECT fill:#43a047,stroke:#2e7d32,stroke-width:2px,color:#ffffff

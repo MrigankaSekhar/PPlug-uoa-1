@@ -10,8 +10,8 @@ MODEL_DIR="${BASE_DIR}"
 DATA_DIR="${BASE_DIR}"
 
 # Set SSL certs for both curl & Hugging Face CLI
-# export SSL_CERT_FILE="/Users/in22339881/Documents/custom-ca-bundle.pem"
-# export REQUESTS_CA_BUNDLE="/Users/in22339881/Documents/custom-ca-bundle.pem"
+export SSL_CERT_FILE="/Users/in22339881/Documents/custom-ca-bundle.pem"
+export REQUESTS_CA_BUNDLE="/Users/in22339881/Documents/custom-ca-bundle.pem"
 
 # ---------------- LaMP-3 Dataset ----------------
 echo "[1/3] Checking LaMP-3 dataset..."

@@ -1,0 +1,57 @@
+
+flowchart LR
+
+  %% ===== Original (Left) =====
+  subgraph OLD["Original Architecture"]
+    OUser[User]
+    OTask[Task Input]
+    OHist[User Histories]
+    OInputEmb["LLM Input Embedding"]
+    OUserEmbed["User Embedder"]
+    OAggr["Input-aware Personal Aggregator"]
+    OLLM["Large Language Model"]
+    OOut["Personalized Output"]
+
+    OUser --> OTask
+    OUser --> OHist
+    OTask --> OInputEmb
+    OHist --> OUserEmbed
+    OInputEmb --> OAggr
+    OUserEmbed --> OAggr
+    OAggr --> OLLM
+    OLLM --> OOut
+  end
+
+  %% ===== New (Right) =====
+  subgraph NEW["New Architecture"]
+    NUser[User]
+    NTask[Task Input]
+    NHists[User Histories]
+    L1["Layer ONE: \nLLM Input Encoder\n(Task Embedding Extraction)"]
+    L2["Layer TWO:\nUser Behavior Encoder\n(Long-term Profile Embeddings)"]
+    L3["Layer THREE:\nInput-aware Personal Aggregator\n(Attention-weighted fusion)"]
+    NL6["NEW Layer SIX:\nSession-Aware Transformer\n(Short-term personalization)"]
+    NL7["NEW Layer SEVEN:\nGraph Embedding Encoder\n(Precomputed GNN vectors)"]
+    NL8["NEW Layer EIGHT:\nGated Cross-Attention Layer\n(Fuse task + personalization)"]
+    L4["Layer FOUR:\nInstruction Token Embedding"]
+    L5["Layer FIVE:\nLLM Decoder / Generator"]
+
+    NUser --> NTask
+    NUser --> NHists
+
+    NTask --> L1
+    NHists --> L2
+    L1 --> L3
+    L2 --> L3
+    L3 --> NL6
+    NL6 --> NL7
+    NL7 --> NL8
+    NL8 --> L4
+    L4 --> L5
+  end
+
+  %% ===== Cross-map lines (dotted) =====
+  OInputEmb -. alignment .- L1
+  OUserEmbed -. alignment .- L2
+  OAggr -. alignment .- L3
+  OLLM -. alignment .- L5

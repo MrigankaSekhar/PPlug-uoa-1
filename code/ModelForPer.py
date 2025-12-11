@@ -23,6 +23,7 @@ class PersonalLLM(nn.Module):
         self.emb_config = self.emb_model.config
         self.emb_emb_size = self.emb_config.hidden_size
 
+
         his_train_emb = torch.cat([torch.zeros(1, self.emb_emb_size), torch.load("../bge_emb/task_" + str(task_id) + "_train_bge.emb")], 0)
         self.his_train_emb_table = nn.Embedding(his_train_emb.size()[0], self.emb_emb_size)
         self.his_train_emb_table.weight = nn.Parameter(his_train_emb)
@@ -63,6 +64,9 @@ class PersonalLLM(nn.Module):
         bsz = his_mask.size()[0]
         his_mask = his_mask.repeat(1, self.mult_k).view(bsz * self.mult_k, -1)
         
+        # Layer TWO
+        # User Behavior Encoder
+        # Loads frozen user history embeddings (BGE precomputed vectors) and aligns them to LLM hidden size using align_mlp
 
         if (self.training) :
             his_embs = self.his_train_emb_table(his_id)
@@ -71,6 +75,9 @@ class PersonalLLM(nn.Module):
         
         his_embs_align = self.align_mlp(his_embs).view(bsz * self.mult_k, -1, self.llm_emb_size)
 
+        # Layer THREE
+        # Input-aware Personal Aggregator
+        # Aggregates task semantics with personalized history signals, using attention mechanism to obtain final profile embeddings
 
         his_weight = torch.bmm(his_embs, task_embs.unsqueeze(-1)) #/ 0.5
         his_weight = his_weight.masked_fill(his_mask.unsqueeze(-1), -torch.inf)
@@ -86,13 +93,24 @@ class PersonalLLM(nn.Module):
         
         task_embs = self.obtain_task_emb(emb_input_ids, emb_attention_mask, emb_token_type_ids)
         profile_embs = self.obtain_profile_emb(his_id, task_embs) * 539.9738
+        # Layer FOUR
+        # Instruction Token Embedding
+        # Matches the instruction embedding injection block shown 
+
         inst_embs = self.align_mlp_inst(self.inst_token) / 7.0 * 539.9738
+
+        # layer ONE
+        # LLM Input Encoder
+        # The HuggingFace Flan‑T5 (or other llm_model) embedding layer converts input IDs into hidden vectors. This is the encoder part.
 
         input_embs = self.llm_model.get_input_embeddings()(llm_input_ids)
 
         input_embs[llm_input_ids == self.llm_model.vocab_size-1] = profile_embs.view(-1, self.llm_emb_size)#bsz, hidden
         input_embs[llm_input_ids == self.llm_model.vocab_size-2] = inst_embs
-
+        # Layer FIVE
+        # LLM Decoder / Generator
+        # The decoder module of the LLM produces task outputs from the personalized input representations. 
+        # The LLM decoder generates the output sequence based on the modified input embeddings
         if self.training:
             reader_output = self.llm_model(
                 inputs_embeds=input_embs,

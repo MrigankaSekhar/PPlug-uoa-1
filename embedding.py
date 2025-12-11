@@ -110,6 +110,7 @@ def sort(corpus_embedding, query_embedding, his_len, new_entry) :
 
     return all_list
 
+
 @torch.no_grad()
 def get_embedding(sentences) :
     # Apply tokenizer

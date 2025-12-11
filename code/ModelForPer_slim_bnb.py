@@ -91,32 +91,50 @@ class PersonalLLM_Slim_BNB(nn.Module):
         self.gate = nn.Linear(self.llm_emb_size * 2, 1)
 
     def obtain_task_emb(self, emb_input_ids, emb_attention_mask, emb_token_type_ids):
-        with torch.no_grad():
-            task_outputs = self.emb_model(
-                input_ids=emb_input_ids,
-                attention_mask=emb_attention_mask
-            )
-        return torch.nn.functional.normalize(task_outputs[0][:, 0], p=2, dim=1)
+        task_inputs = {
+            'input_ids': emb_input_ids,
+            'attention_mask': emb_attention_mask,
+            'token_type_ids': emb_token_type_ids
+        }
+        task_outputs = self.emb_model(**task_inputs)
+        # Raw BGE embedding (768)
+        task_vecs_raw = torch.nn.functional.normalize(
+            task_outputs[0][:, 0], p=2, dim=1
+        )
+        # Save for later use in obtain_profile_emb
+        self._last_task_vecs_raw = task_vecs_raw
+        # Project into LLM space (512)
+        task_vecs_aligned = self.align_mlp(task_vecs_raw)
+        return task_vecs_aligned
 
-    def obtain_profile_emb(self, his_id, task_embs):
+    def obtain_profile_emb(self, his_id, task_embs_aligned):
+        """
+        task_embs_aligned: LLM-space embedding (512)
+        But we use stored raw BGE-space embedding (768) for scoring against his_embs.
+        """
         his_mask = torch.eq(his_id, 0)
         bsz = his_mask.size(0)
         his_mask = his_mask.repeat(1, self.mult_k).view(bsz * self.mult_k, -1)
 
+        # Raw history embeddings from BGE table (768)
         if self.training:
             his_embs = self.his_train_emb_table(his_id)
         else:
             his_embs = self.his_dev_emb_table(his_id)
 
+        # Align history embeddings for LLM space fusion
         his_embs_align = self.align_mlp(his_embs).view(
             bsz * self.mult_k, -1, self.llm_emb_size
         )
 
-        his_weight = torch.bmm(his_embs, task_embs.unsqueeze(-1))
+        # Use raw task embedding in 768-dim space for similarity scoring
+        task_embs_raw = self._last_task_vecs_raw  # (B, 768)
+        his_weight = torch.bmm(his_embs, task_embs_raw.unsqueeze(-1))
         his_weight = his_weight.masked_fill(his_mask.unsqueeze(-1), -torch.inf)
         his_weight = torch.nn.functional.softmax(his_weight, dim=1)
         his_weight = his_weight.to(his_embs.dtype)
 
+        # Weighted sum in LLM space
         profile_embs = torch.bmm(
             torch.transpose(his_embs_align, 1, 2), his_weight
         ).squeeze(-1)
@@ -147,8 +165,16 @@ class PersonalLLM_Slim_BNB(nn.Module):
             combined_embs
         )
 
+        # ===== INJECTION POINT =====
+        # Get standard token embeddings
+        inputs_embeds = self.llm_model.encoder.embed_tokens(llm_input_ids)
+
+        # Inject fused_task_embs into the sequence — e.g., add to first token embedding
+        inputs_embeds[:, 0:1, :] = inputs_embeds[:, 0:1, :] + fused_task_embs
+
+        # Now run the LLM with modified embeddings
         outputs = self.llm_model(
-            input_ids=llm_input_ids,
+            inputs_embeds=inputs_embeds,
             attention_mask=llm_attention_mask,
             labels=labels
         )

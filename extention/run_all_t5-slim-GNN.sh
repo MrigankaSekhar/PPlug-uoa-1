@@ -1,19 +1,22 @@
-
 #!/bin/bash
-
-# Run for task_id = 3 only
 task_id=3
-
-# Set parameters for task_id=3
 epoch=1
 len=10
 
-# Execute deepspeed command
-deepspeed --master_port=29501 main_profile.py \
+# Check if graph embeddings exist — optional
+GRAPH_EMB=../graph_emb/task_${task_id}_graph.emb
+if [ ! -f "$GRAPH_EMB" ]; then
+  echo "⚠ Graph embeddings not found for task_id=${task_id}. Model will skip GNN."
+fi
+
+# Execute updated main script in extention/
+deepspeed --master_port=29501 extention/main_profile-slim.py \
     --model_path ../FlanT5-small/ \
     --emb_model_path ../bge-base-en-v1.5/ \
     --train_file ../LaMP_time_${task_id}_id/train_aug_input.json \
     --dev_file ../LaMP_time_${task_id}_id/dev_profile.json \
+    --use_4bit True \
+    --use_8bit False \
     --max_input_len 256 \
     --max_his_len 512 \
     --max_new_len ${len} \
@@ -23,7 +26,7 @@ deepspeed --master_port=29501 main_profile.py \
     --weight_decay 1e-4 \
     --warmup_ratio 0.05 \
     --num_train_epochs ${epoch} \
-    --per_device_train_batch_size 64 \
+    --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 8 \
     --logging_dir ./log/ \

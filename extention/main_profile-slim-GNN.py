@@ -8,8 +8,10 @@ from transformers import (
     AutoTokenizer, AutoModel,
     Seq2SeqTrainer, Seq2SeqTrainingArguments
 )
-from PersonalDataset_profile import PersonalDataset
-from ModelForPer_slim_bnb import PersonalLLM_Slim_BNB   # <-- new slim+B&A model
+
+# IMPORT from the extension folder
+from extention.PersonalDataset_profile import PersonalDataset
+from extention.ModelForPer_slim_GNN import PersonalLLM_Slim   # <-- updated slim model
 
 # -----------------------------
 # Arguments Setup
@@ -77,22 +79,19 @@ def train_model(model_args, data_args, training_args):
         data_args.max_his_len, llm_tokenizer, emb_tokenizer
     )
 
-    # Model — new Slim variant with optional quantization
+    # Model — our updated slim variant
     task_id = int(training_args.output_dir.split("_")[-1])
-    model = PersonalLLM_Slim_BNB(
-        model_args=model_args,
+    model = PersonalLLM_Slim(
+        llm_model=transformers.T5ForConditionalGeneration.from_pretrained(model_args.model_path),
         emb_model=emb_model,
         max_input_len=data_args.max_input_len,
         max_new_len=data_args.max_new_len,
-        task_id=task_id,
-        use_4bit=model_args.use_4bit,
-        use_8bit=model_args.use_8bit
+        task_id=task_id
     )
-
     model.llm_model.resize_token_embeddings(len(llm_tokenizer))
 
     # -----------------------------
-    # Custom collator to handle our custom field names & numpy arrays efficiently
+    # Custom collator
     # -----------------------------
     import torch
     def my_collator(features):
@@ -105,6 +104,8 @@ def train_model(model_args, data_args, training_args):
             'emb_attention_mask': torch.stack([torch.as_tensor(f['emb_attention_mask'], dtype=torch.long) for f in features]),
             'emb_token_type_ids': torch.stack([torch.as_tensor(f['emb_token_type_ids'], dtype=torch.long) for f in features]),
             'his_id': torch.stack([torch.as_tensor(f['his_id'], dtype=torch.long) for f in features]),
+            'session_ids': torch.stack([torch.as_tensor(f['session_ids'], dtype=torch.long) for f in features]),       # NEW
+            'graph_node_ids': torch.stack([torch.as_tensor(f['graph_node_ids'], dtype=torch.long) for f in features]) # NEW
         }
 
     # Trainer
@@ -114,11 +115,11 @@ def train_model(model_args, data_args, training_args):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=llm_tokenizer,
-        data_collator=my_collator,  # <-- use our custom collator here
+        data_collator=my_collator,
         compute_metrics=compute_metrics_classification
     )
 
-    # Train
+    # Train & evaluate
     trainer.train()
     outputs = trainer.evaluate()
     print(outputs)
@@ -130,7 +131,6 @@ if __name__ == '__main__':
     transformers.set_seed(42)
     global llm_tokenizer, emb_tokenizer
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 

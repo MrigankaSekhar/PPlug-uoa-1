@@ -26,6 +26,13 @@ dependencies:
       - sacrebleu==2.4.3
       - wandb==0.13.11
       - psutil<6.0.0
-      - rank-bm25==0.2.2   # Added for embedding.py
+      - rank-bm25==0.2.2
       - deepspeed==0.13.1
-      - bitsandbytes==0.43.1
+      - bitsandbytes==0.42.0      
+      # --- Added PyTorch Geometric and dependencies ---
+  - pip:
+      - torch-geometric==2.5.0
+      - torch-scatter==2.1.1
+      - torch-sparse==0.6.17
+      - torch-cluster==1.6.1
+      - torch-spline-conv==1.2.2
