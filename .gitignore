@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+*wandb/
+.DS_Store
+.vscode/
+.env
+.env.*local
+.idea/
+*.iml 
+*__pycache__/
+*.zip
+# embeddings
+*.emb
+*.DS_Store*
+
+# other project files
+*FlanT*
+*LaMP*
+*.log
+graph_emb/
+bge-*

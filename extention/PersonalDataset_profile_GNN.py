@@ -65,22 +65,49 @@ class PersonalDataset(Dataset):
 
     def __getitem__(self, idx):
         query, output_str, his_id = self.parse_data(linecache.getline(self.path, idx+1))
-        
-        inputs = self.llm_tokenizer("[INST_PER_TOKEN][SPC_PER_TOKEN]"+query,
-                                    max_length=self.max_input_len+10, padding='max_length', truncation=True)
-        targets = self.llm_tokenizer(output_str, max_length=self.max_new_len, padding='max_length', truncation=True)
-        emb_inputs = self.emb_tokenizer("Represent this sentence for searching relevant passages:"+self.process_qry(query),
-                                        max_length=self.max_input_len+20, padding='max_length', truncation=True)
 
+        # ==== Ensure his_id always exists ====
+        if not his_id or not isinstance(his_id, (list, tuple)):
+            his_id = [0] * self.max_his_len
+        else:
+            # pad or truncate to fixed history length
+            if len(his_id) < self.max_his_len:
+                his_id = his_id + [0] * (self.max_his_len - len(his_id))
+            else:
+                his_id = his_id[:self.max_his_len]
+
+        # ==== Tokenizers ====
+        inputs = self.llm_tokenizer(
+            "[INST_PER_TOKEN][SPC_PER_TOKEN]" + query,
+            max_length=self.max_input_len + 10,
+            padding='max_length',
+            truncation=True
+        )
+        targets = self.llm_tokenizer(
+            output_str,
+            max_length=self.max_new_len,
+            padding='max_length',
+            truncation=True
+        )
+        emb_inputs = self.emb_tokenizer(
+            "Represent this sentence for searching relevant passages:" + self.process_qry(query),
+            max_length=self.max_input_len + 20,
+            padding='max_length',
+            truncation=True
+        )
+
+        # Labels: mask pad tokens with -100
         labels = [x if x != self.llm_tokenizer.pad_token_id else -100 for x in targets["input_ids"]]
 
-        # === NEW: Session IDs (short-term context) ===
-        session_len = min(3, len(his_id))  # last N interactions (here N=3)
-        session_ids = his_id[-session_len:] + [0] * (session_len - len(his_id[-session_len:]))
+        # ==== Session IDs = last 3 his_ids (short-term history) ====
+        session_len = min(3, len(his_id))
+        session_ids = list(his_id[-session_len:])
+        if len(session_ids) < 3:
+            session_ids += [0] * (3 - len(session_ids))
 
-        # === NEW: Graph Node IDs placeholder ===
-        # In future: replace this mapping with your Neo4j node ID mapping
-        user_node_id = his_id[0] if his_id[0] != 0 else idx + 1
+        # ==== Graph Node IDs ====
+        # For now: user node = first his_id (non-zero if present), item node = second his_id or 0
+        user_node_id = his_id[0] if his_id[0] != 0 else idx + 1  # fallback to pseudo-ID
         item_node_id = his_id[1] if len(his_id) > 1 and his_id[1] != 0 else 0
         graph_node_ids = [user_node_id, item_node_id]
 
@@ -90,8 +117,8 @@ class PersonalDataset(Dataset):
             'labels': np.array(labels, dtype=np.int32),
             'emb_input_ids': np.array(emb_inputs['input_ids'], dtype=np.int32),
             'emb_attention_mask': np.array(emb_inputs['attention_mask'], dtype=np.int32),
-            'emb_token_type_ids': np.array(emb_inputs['token_type_ids'], dtype=np.int32),
+            'emb_token_type_ids': np.array(emb_inputs.get('token_type_ids', [0]*len(emb_inputs['input_ids'])), dtype=np.int32),
             'his_id': np.array(his_id, dtype=np.int32),
-            'session_ids': np.array(session_ids, dtype=np.int32),          # NEW
-            'graph_node_ids': np.array(graph_node_ids, dtype=np.int32)     # NEW
+            'session_ids': np.array(session_ids, dtype=np.int32),
+            'graph_node_ids': np.array(graph_node_ids, dtype=np.int32)
         }

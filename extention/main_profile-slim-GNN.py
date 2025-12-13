@@ -10,8 +10,8 @@ from transformers import (
 )
 
 # IMPORT from the extension folder
-from extention.PersonalDataset_profile import PersonalDataset
-from extention.ModelForPer_slim_GNN import PersonalLLM_Slim   # <-- updated slim model
+from PersonalDataset_profile_GNN import PersonalDataset
+from ModelForPer_slim_GNN import PersonalLLM_Slim   # <-- updated slim model
 
 # -----------------------------
 # Arguments Setup
