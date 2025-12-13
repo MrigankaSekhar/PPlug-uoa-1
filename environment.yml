@@ -29,8 +29,6 @@ dependencies:
       - rank-bm25==0.2.2
       - deepspeed==0.13.1
       - bitsandbytes==0.42.0      
-      # --- Added PyTorch Geometric and dependencies ---
-  - pip:
       - torch-geometric==2.5.0
       - torch-scatter==2.1.1
       - torch-sparse==0.6.17
