@@ -1,9 +1,11 @@
+
 import os
 import json
 import time
 import argparse
 import torch
 import gc
+import numpy as np
 from tqdm import tqdm
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
@@ -17,7 +19,7 @@ import torch.nn as nn
 TASK_ID = 3
 GRAPH_DIR = "../graph_emb"
 os.makedirs(GRAPH_DIR, exist_ok=True)
-SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_graph.emb")
+SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_graph.npy")  # Directly NP format
 MAP_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph.json")
 
 TRAIN_FILE = f"../LaMP_time_{TASK_ID}/train_questions.json"
@@ -118,8 +120,8 @@ for src_id, tgt_id in edges:
 edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
 num_nodes = current_offset
 
-X_SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x.pt")
-PARTIAL_X_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x_partial.pt")
+X_SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x.npy")  # FP16 array directly
+PARTIAL_X_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x_partial.npy")
 PROCESSED_IDS_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_processed_ids.json")
 MODEL_CKPT_PATH = os.path.join(GRAPH_DIR, "graphsage_epoch{}.pt")
 
@@ -127,99 +129,63 @@ MODEL_CKPT_PATH = os.path.join(GRAPH_DIR, "graphsage_epoch{}.pt")
 # STAGE FUNCTIONS
 # --------------------------
 def embed_chunk(chunk_index, num_chunks):
-    # Load current partial state
     if os.path.exists(PARTIAL_X_PATH):
-        print(f"♻️ Resuming from partial checkpoint: {PARTIAL_X_PATH}")
-        x = torch.load(PARTIAL_X_PATH, map_location=device)
-        processed_ids = set()
-        if os.path.exists(PROCESSED_IDS_PATH):
-            processed_ids = set(json.load(open(PROCESSED_IDS_PATH)))
-            print(f"✅ Loaded {len(processed_ids)} processed node IDs from previous run")
+        print(f"♻️ Resuming from partial NP checkpoint: {PARTIAL_X_PATH}")
+        x = np.load(PARTIAL_X_PATH, allow_pickle=False).astype(np.float16)
+        processed_ids = set(json.load(open(PROCESSED_IDS_PATH))) if os.path.exists(PROCESSED_IDS_PATH) else set()
     else:
-        print("🚀 Starting fresh embedding for this chunk.")
-        x = torch.zeros((num_nodes, EMB_DIM), device=device, dtype=torch.float32)
+        print("🚀 Starting fresh NP embedding for this chunk.")
+        x = np.zeros((num_nodes, EMB_DIM), dtype=np.float16)
         processed_ids = set()
 
-    # Precision selection
-    if device.type == 'cuda':
-        model_dtype = torch.float16
-        print("⚡ Using GPU with FP16 precision for embeddings")
-    else:
-        model_dtype = torch.float32
-        print("🖥️ Using CPU/MPS with FP32 precision for embeddings")
-
+    model_dtype = torch.float16 if device.type == 'cuda' else torch.float32
     tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_PATH)
-    model = AutoModel.from_pretrained(
-        BGE_MODEL_PATH,
-        torch_dtype=model_dtype
-    ).to(device).eval()
+    model = AutoModel.from_pretrained(BGE_MODEL_PATH, torch_dtype=model_dtype).to(device).eval()
 
-    # Bigger batches for GPU
-    if device.type == 'cuda':
-        batch_size = 4096   # adjust based on VRAM
-        save_every = 200
-    else:
-        batch_size = 256
-        save_every = 50
-        
-    projection_layer = None
-    if EMB_DIM != BGE_OUTPUT_DIM:
-        projection_layer = nn.Linear(BGE_OUTPUT_DIM, EMB_DIM).to(device)
+    batch_size = 4096 if device.type == 'cuda' else 256
+    save_every = 200 if device.type == 'cuda' else 50
 
-    # Select only unprocessed nodes in this chunk
+    projection_layer = nn.Linear(BGE_OUTPUT_DIM, EMB_DIM).to(device) if EMB_DIM != BGE_OUTPUT_DIM else None
+
     text_nodes_all = [(key, idx) for typ in node_maps for key, idx in node_maps[typ].items() if isinstance(key, str)]
     chunk_size = len(text_nodes_all) // num_chunks
     start_i = chunk_index * chunk_size
     end_i = (chunk_index + 1) * chunk_size if chunk_index < num_chunks - 1 else len(text_nodes_all)
-    text_nodes = text_nodes_all[start_i:end_i]
-    text_nodes = [tn for tn in text_nodes if tn[1] not in processed_ids]
+    text_nodes = [tn for tn in text_nodes_all[start_i:end_i] if tn[1] not in processed_ids]
 
-    print(f"📦 Processing chunk {chunk_index+1}/{num_chunks} — nodes {start_i} to {end_i-1}")
-    print(f"⏩ Skipping {len(processed_ids)} previously processed nodes in this chunk")
-    print(f"🎯 Remaining nodes to embed: {len(text_nodes)}")
+    print(f"📦 Chunk {chunk_index+1}/{num_chunks} — {len(text_nodes)} to embed")
 
     for batch_num, i in enumerate(tqdm(range(0, len(text_nodes), batch_size), desc="Embedding")):
         batch_segment = text_nodes[i:i+batch_size]
-        batch_keys = [node[0] for node in batch_segment]
-        batch_indices = [node[1] for node in batch_segment]
-
-        inputs = tokenizer(batch_keys, return_tensors="pt", padding=True, truncation=True, max_length=32).to(device)
+        inputs = tokenizer([node[0] for node in batch_segment], return_tensors="pt", padding=True, truncation=True, max_length=32).to(device)
         with torch.no_grad():
             embeddings = model(**inputs).last_hidden_state.mean(dim=1)
             if projection_layer:
                 embeddings = projection_layer(embeddings)
-
-        for j, idx in enumerate(batch_indices):
-            x[idx] = embeddings[j].to(torch.float32)
+        embeddings = embeddings.cpu().numpy().astype(np.float16)
+        for j, idx in enumerate([node[1] for node in batch_segment]):
+            x[idx] = embeddings[j]
             processed_ids.add(idx)
 
         if (batch_num + 1) % save_every == 0 or (i + batch_size >= len(text_nodes)):
-            torch.save(x, PARTIAL_X_PATH)
+            np.save(PARTIAL_X_PATH, x)
             json.dump(list(processed_ids), open(PROCESSED_IDS_PATH, "w"))
-            print(f"💾 Partial checkpoint saved at batch {batch_num+1} — {len(processed_ids)} nodes done")
 
-    # Final save of chunk progress
-    torch.save(x, PARTIAL_X_PATH)
+    np.save(PARTIAL_X_PATH, x)
     json.dump(list(processed_ids), open(PROCESSED_IDS_PATH, "w"))
-    print(f"✅ Chunk {chunk_index+1} completed — total {len(processed_ids)} nodes embedded in this chunk")
-
-    del tokenizer, model
-    if projection_layer:
-        del projection_layer
     torch.cuda.empty_cache()
     gc.collect()
 
 def merge_chunks_to_full():
-    print("🔄 Merging partial embeddings into full X_SAVE_PATH...")
+    print("🔄 Merging partial embeddings into full NP file...")
     if not os.path.exists(PARTIAL_X_PATH):
-        raise FileNotFoundError(f"❌ Partial embeddings file not found: {PARTIAL_X_PATH}")
-    x_partial = torch.load(PARTIAL_X_PATH, map_location="cpu")
-    torch.save(x_partial.to(torch.float32), X_SAVE_PATH)
-    print(f"✅ Merged and saved final embeddings to {X_SAVE_PATH}")
+        raise FileNotFoundError(f"❌ Partial embeddings not found: {PARTIAL_X_PATH}")
+    x_partial = np.load(PARTIAL_X_PATH, allow_pickle=False).astype(np.float16)
+    np.save(X_SAVE_PATH, x_partial)
+    print(f"✅ Merged and saved final NP embeddings to {X_SAVE_PATH}")
 
 def train_gnn():
-    start_time = time.time()
-    x = torch.load(X_SAVE_PATH, map_location=device)
+    x = torch.tensor(np.load(X_SAVE_PATH, allow_pickle=False).astype(np.float16))
     data_obj = Data(x=x, edge_index=edge_index).to(device)
 
     class GraphSAGE(torch.nn.Module):
@@ -228,13 +194,10 @@ def train_gnn():
             self.conv1 = SAGEConv(in_c, h_c)
             self.conv2 = SAGEConv(h_c, out_c)
         def forward(self, x, edge_index):
-            x = self.conv1(x, edge_index).relu()
-            x = self.conv2(x, edge_index)
-            return x
+            return self.conv2(self.conv1(x, edge_index).relu(), edge_index)
 
     gnn_model = GraphSAGE(EMB_DIM, 128, EMB_DIM).to(device)
-    if device.type == 'cuda':
-        gnn_model = gnn_model.half()
+    if device.type == 'cuda': gnn_model = gnn_model.half()
     optimizer = torch.optim.Adam(gnn_model.parameters(), lr=0.01)
 
     loader = NeighborLoader(data_obj, num_neighbors=[15, 10], batch_size=256, shuffle=True)
@@ -251,7 +214,7 @@ def train_gnn():
         torch.save(gnn_model.state_dict(), MODEL_CKPT_PATH.format(epoch+1))
 
 def infer_gnn():
-    x = torch.load(X_SAVE_PATH, map_location=device)
+    x = torch.tensor(np.load(X_SAVE_PATH, allow_pickle=False).astype(np.float16))
     data_obj = Data(x=x, edge_index=edge_index).to(device)
 
     class GraphSAGE(torch.nn.Module):
@@ -260,32 +223,21 @@ def infer_gnn():
             self.conv1 = SAGEConv(in_c, h_c)
             self.conv2 = SAGEConv(h_c, out_c)
         def forward(self, x, edge_index):
-            x = self.conv1(x, edge_index).relu()
-            x = self.conv2(x, edge_index)
-            return x
+            return self.conv2(self.conv1(x, edge_index).relu(), edge_index)
 
-    ckpts = sorted(
-        [f for f in os.listdir(GRAPH_DIR) if f.startswith("graphsage_epoch") and f.endswith(".pt")],
-        key=lambda f: int(f.split("epoch")[1].split(".")[0])
-    )
-    if not ckpts:
-        raise FileNotFoundError("❌ No GNN checkpoints found — run the train stage first.")
+    ckpts = sorted([f for f in os.listdir(GRAPH_DIR) if f.startswith("graphsage_epoch")], key=lambda f: int(f.split("epoch")[1].split(".")[0]))
     latest_ckpt = ckpts[-1]
-    print(f"📂 Loading latest checkpoint: {latest_ckpt}")
-
     gnn_model = GraphSAGE(EMB_DIM, 128, EMB_DIM).to(device)
     gnn_model.load_state_dict(torch.load(os.path.join(GRAPH_DIR, latest_ckpt), map_location=device))
     gnn_model.eval()
 
+    final_embeddings = np.zeros((num_nodes, EMB_DIM), dtype=np.float16)
     loader = NeighborLoader(data_obj, num_neighbors=[-1], batch_size=256, shuffle=False)
-    final_embeddings = torch.zeros((num_nodes, EMB_DIM), dtype=torch.float32)
-
     with torch.inference_mode():
         for batch in tqdm(loader, desc="Final inference"):
-            out = gnn_model(batch.x, batch.edge_index).cpu()
+            out = gnn_model(batch.x, batch.edge_index).cpu().numpy().astype(np.float16)
             final_embeddings[batch.n_id] = out
-
-    torch.save(final_embeddings, SAVE_PATH)
+    np.save(SAVE_PATH, final_embeddings)
     json.dump(his_to_graph, open(MAP_PATH, "w"))
     print(f"✅ Saved graph embeddings to {SAVE_PATH}")
 
@@ -307,13 +259,3 @@ if __name__ == "__main__":
         train_gnn()
     elif args.stage == "infer":
         infer_gnn()
-
-# ... inside your final inference stage after you have X (tensor of embeddings)
-
-import numpy as np
-
-if __name__ == "__main__":
-    # ... after infer_gnn or final embedding computation
-    final_array = x.cpu().numpy().astype(np.float16)  # Half precision
-    np.save(SAVE_PATH.replace(".emb", ".npy"), final_array)
-    print(f"✅ Saved FP16 memory-mapped embeddings to {SAVE_PATH.replace('.emb', '.npy')}")
