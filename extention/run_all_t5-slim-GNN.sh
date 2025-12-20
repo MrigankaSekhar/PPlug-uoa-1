@@ -40,5 +40,5 @@ deepspeed --master_port=29501 main_profile-slim-GNN.py \
     --deepspeed dp.json \
     --report_to none \
     --save_total_limit 1 \
-    --bf16 True \
+    --bf16 False \
 > output.log 2>&1
