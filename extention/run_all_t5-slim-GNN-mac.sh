@@ -21,8 +21,8 @@ LOG_FILE="./log/output_mac_${task_id}_${timestamp}.log"
 python main_profile-slim-GNN.py \
     --model_path ../FlanT5-small/ \
     --emb_model_path ../bge-base-en-v1.5/ \
-    --train_file ../LaMP_time_${task_id}_id/train_aug_input.json \
-    --dev_file ../LaMP_time_${task_id}_id/dev_profile.json \
+    --train_file ../LaMP_time_${task_id}_subset_id/train_aug_input.json \
+    --dev_file ../LaMP_time_${task_id}_subset_id/dev_profile.json \
     --max_input_len 256 \
     --use_subset True \
     --max_his_len 512 \

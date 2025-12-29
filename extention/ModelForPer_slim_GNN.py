@@ -13,7 +13,15 @@ class PersonalLLM_Slim(nn.Module):
     - Gated cross-attention fusion applied to ALL encoder tokens
     """
 
-    def __init__(self, llm_model, emb_model, max_input_len, max_new_len, task_id):
+    def __init__(self, llm_model, emb_model, max_input_len, max_new_len, task_id,
+                 use_inst_token=True,
+                 use_align_mlp_inst=True,
+                 use_align_mlp=True,
+                 use_align_mlp_session=False,
+                 use_align_mlp_graph=False,
+                 use_session_encoder=False,
+                 use_cross_attn=False,
+                 use_gate=False,):
         super().__init__()
         self.llm_model = llm_model
         self.emb_model = emb_model
@@ -24,6 +32,16 @@ class PersonalLLM_Slim(nn.Module):
         self.llm_emb_size = self.llm_config.hidden_size
         self.emb_config = self.emb_model.config
         self.emb_emb_size = self.emb_config.hidden_size
+
+        # Store flags for A/B testing
+        self.use_inst_token = use_inst_token
+        self.use_align_mlp_inst = use_align_mlp_inst
+        self.use_align_mlp = use_align_mlp
+        self.use_align_mlp_session = use_align_mlp_session
+        self.use_align_mlp_graph = use_align_mlp_graph
+        self.use_session_encoder = use_session_encoder
+        self.use_cross_attn = use_cross_attn
+        self.use_gate = use_gate
 
         # === Load memmap history ===
         train_npy_path = f"../bge_emb/task_{task_id}_train_bge.npy"
@@ -41,80 +59,77 @@ class PersonalLLM_Slim(nn.Module):
 
         # Trainable personalization modules with (Multi‑Layer Perceptron aligners)
         # ------------------------------------------------------------------
-        # Layer: Instruction Token Embedding
-        # Purpose: A single learnable vector appended to the sequence to inject
-        #          a "prompt-like" control signal for the LLM during generation.
-        self.inst_token = nn.Parameter(torch.rand(self.emb_emb_size), requires_grad=True)
+        if self.use_inst_token:
+            # Layer: Instruction Token Embedding
+            # Purpose: A single learnable vector appended to the sequence to inject
+            #          a "prompt-like" control signal for the LLM during generation.
+            self.inst_token = nn.Parameter(torch.rand(self.emb_emb_size), requires_grad=True)
 
         # For alignment MLPs, we use mult_k=1 for direct dim-matching
         self.mult_k = 1
 
-        # Layer: Align MLP (for instruction token) 
-        # Purpose: Projects instruction embedding from emb_model space (BGE dims)
-        #          to LLM embedding space (Flan-T5 hidden size), allowing 
-        #          fusion with the original token embedding table.
-        self.align_mlp_inst = nn.Sequential(
-            nn.Linear(self.emb_emb_size, self.llm_emb_size),
-            nn.GELU(),
-            nn.Linear(self.llm_emb_size, self.llm_emb_size)
-        )
+        if self.use_align_mlp_inst:
+            # Layer: Align MLP (for instruction token) 
+            # Purpose: Projects instruction embedding from emb_model space (BGE dims)
+            #          to LLM embedding space (Flan-T5 hidden size), allowing 
+            #          fusion with the original token embedding table.
+            self.align_mlp_inst = nn.Sequential(
+                nn.Linear(self.emb_emb_size, self.llm_emb_size),
+                nn.GELU(),
+                nn.Linear(self.llm_emb_size, self.llm_emb_size)
+            )
 
-        # Layer: Align MLP (for general profile embeddings)
-        # Purpose: Projects static profile/history embeddings to LLM space.
-        self.align_mlp = nn.Sequential(
-            nn.Linear(self.emb_emb_size, self.llm_emb_size),
-            nn.GELU(),
-            nn.Linear(self.llm_emb_size, self.llm_emb_size)
-        )
+        if self.use_align_mlp:
+            # Layer: Align MLP (for general profile embeddings)
+            # Purpose: Projects static profile/history embeddings to LLM space.
+            self.align_mlp = nn.Sequential(
+                nn.Linear(self.emb_emb_size, self.llm_emb_size),
+                nn.GELU(),
+                nn.Linear(self.llm_emb_size, self.llm_emb_size)
+            )
 
-        # Layer: Align MLP Session
-        # Purpose: Projects short-term session embeddings from session encoder
-        #          into the LLM token embedding space.
-        self.align_mlp_session = nn.Sequential(
-            nn.Linear(self.emb_emb_size, self.llm_emb_size),
-            nn.GELU(),
-            nn.Linear(self.llm_emb_size, self.llm_emb_size)
-        )
+        if self.use_align_mlp_session:
+            # Layer: Align MLP Session
+            # Purpose: Projects short-term session embeddings from session encoder
+            #          into the LLM token embedding space.
+            self.align_mlp_session = nn.Sequential(
+                nn.Linear(self.emb_emb_size, self.llm_emb_size),
+                nn.GELU(),
+                nn.Linear(self.llm_emb_size, self.llm_emb_size)
+            )
 
-        # Layer: Align MLP Graph
-        # Purpose: Projects collaborative graph embeddings (user-item-relations)
-        #          into the LLM token embedding space so they can be attended 
-        #          alongside profile and session signals.
-        self.align_mlp_graph = nn.Sequential(
-            nn.Linear(self.emb_emb_size, self.llm_emb_size),
-            nn.GELU(),
-            nn.Linear(self.llm_emb_size, self.llm_emb_size)
-        )
+        if self.use_align_mlp_graph:
+            # Layer: Align MLP Graph
+            # Purpose: Projects collaborative graph embeddings (user-item-relations)
+            #          into the LLM token embedding space so they can be attended 
+            #          alongside profile and session signals.
+            self.align_mlp_graph = nn.Sequential(
+                nn.Linear(self.emb_emb_size, self.llm_emb_size),
+                nn.GELU(),
+                nn.Linear(self.llm_emb_size, self.llm_emb_size)
+            )
 
-        # Layer: Session-aware Transformer Encoder
-        # Purpose: Learns temporal context from recent clickstream or short-term 
-        #          history (session_ids), output is zone that captures recency.
-        self.session_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=self.emb_emb_size, nhead=4, batch_first=True),
-            num_layers=2
-        )
+        if self.use_session_encoder:
+            # Layer: Session-aware Transformer Encoder
+            # Purpose: Learns temporal context from recent clickstream or short-term 
+            #          history (session_ids), output is zone that captures recency.
+            self.session_encoder = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(d_model=self.emb_emb_size, nhead=4, batch_first=True),
+                num_layers=2
+            )
 
-        # Layer: Gated Multi-Head Cross-Attention
-        # Purpose: Allows the LLM to attend to personalized vectors (profile, 
-        #          session, graph) with a learned gate to control influence.
-        self.cross_attn = nn.MultiheadAttention(embed_dim=self.llm_emb_size, num_heads=8, batch_first=True)
+        if self.use_cross_attn:
+            # Layer: Gated Multi-Head Cross-Attention
+            # Purpose: Allows the LLM to attend to personalized vectors (profile, 
+            #          session, graph) with a learned gate to control influence.
+            self.cross_attn = nn.MultiheadAttention(embed_dim=self.llm_emb_size, num_heads=8, batch_first=True)
         
-        # Layer: Attention Gate
-        # Purpose: Scalar gate computed per token by concatenating original 
-        #          task embeddings and cross-attended outputs; balances 
-        #          personalization vs. pure task relevance.
-        self.gate = nn.Linear(self.llm_emb_size * 2, 1)
-
-        # for layer in [self.align_mlp, self.align_mlp_inst,
-        #               self.align_mlp_session, self.align_mlp_graph,
-        #               self.session_encoder, self.cross_attn, self.gate]:
-        #     for _, p in layer.named_parameters():
-        #         p.requires_grad = True
-
-        # # Freeze LLM backbone
-        # for _, p in self.llm_model.named_parameters():
-        #     p.requires_grad = False
-
+        if self.use_gate:
+            # Layer: Attention Gate
+            # Purpose: Scalar gate computed per token by concatenating original 
+            #          task embeddings and cross-attended outputs; balances 
+            #          personalization vs. pure task relevance.
+            self.gate = nn.Linear(self.llm_emb_size * 2, 1)
 
         # ✅ Freeze full LLM backbone
         for _, p in self.llm_model.named_parameters():
@@ -125,11 +140,14 @@ class PersonalLLM_Slim(nn.Module):
             p.requires_grad = False
 
         # ✅ Ensure all fusion/projection layers remain trainable
-        for layer in [self.align_mlp, self.align_mlp_inst,
-                      self.align_mlp_session, self.align_mlp_graph,
-                      self.session_encoder, self.cross_attn, self.gate]:
-            for _, p in layer.named_parameters():
-                p.requires_grad = True
+        for layer_name in [
+            'align_mlp', 'align_mlp_inst', 'align_mlp_session', 'align_mlp_graph',
+            'session_encoder', 'cross_attn', 'gate'
+        ]:
+            layer = getattr(self, layer_name, None)
+            if layer is not None:
+                for _, p in layer.named_parameters():
+                    p.requires_grad = True
                 
         self._printed_debug_shapes = False
 
@@ -164,7 +182,7 @@ class PersonalLLM_Slim(nn.Module):
         )
         task_vecs_raw = torch.nn.functional.normalize(task_outputs[0][:, 0], p=2, dim=1)
         self._last_task_vecs_raw = task_vecs_raw
-        return self.align_mlp(task_vecs_raw)
+        return self.align_mlp(task_vecs_raw) if self.use_align_mlp else task_vecs_raw
 
     def obtain_profile_emb(self, his_id, task_embs_aligned):
         his_mask = torch.eq(his_id, 0)
@@ -178,12 +196,15 @@ class PersonalLLM_Slim(nn.Module):
         elif his_embs.ndim == 1:
             his_embs = his_embs.unsqueeze(0)
 
-        # 🔹 Ensure dtype matches the Linear layer before projection (prevents mat1/mat2 dtype mismatch)
-        align_first: nn.Linear = self.align_mlp[0]  # type: ignore
-        target_dtype = align_first.weight.dtype
-        his_embs = his_embs.to(dtype=target_dtype)
+        if self.use_align_mlp:
+            # 🔹 Ensure dtype matches the Linear layer before projection (prevents mat1/mat2 dtype mismatch)
+            align_first: nn.Linear = self.align_mlp[0]  # type: ignore
+            target_dtype = align_first.weight.dtype
+            his_embs = his_embs.to(dtype=target_dtype)
+            his_embs_align = self.align_mlp(his_embs).view(bsz * self.mult_k, -1, self.llm_emb_size)
+        else:
+            his_embs_align = his_embs
 
-        his_embs_align = self.align_mlp(his_embs).view(bsz * self.mult_k, -1, self.llm_emb_size)
         task_embs_raw = self._last_task_vecs_raw
         his_weight = torch.bmm(his_embs, task_embs_raw.unsqueeze(-1))
         his_weight = his_weight.masked_fill(his_mask.unsqueeze(-1), -torch.inf)
@@ -192,9 +213,14 @@ class PersonalLLM_Slim(nn.Module):
         return torch.bmm(his_embs_align.transpose(1, 2), his_weight).squeeze(-1)
 
     def gated_cross_attention(self, task_embs, user_embs):
+        if not self.use_cross_attn:
+            return task_embs
         attn_out, _ = self.cross_attn(task_embs, user_embs, user_embs)
-        gate_val = torch.sigmoid(self.gate(torch.cat([task_embs, attn_out], dim=-1)))
-        return gate_val * attn_out + (1 - gate_val) * task_embs
+        if self.use_gate:
+            gate_val = torch.sigmoid(self.gate(torch.cat([task_embs, attn_out], dim=-1)))
+            return gate_val * attn_out + (1 - gate_val) * task_embs
+        else:
+            return attn_out
 
     def forward(self, llm_input_ids, llm_attention_mask, labels,
                 emb_input_ids, emb_attention_mask, emb_token_type_ids,
@@ -202,7 +228,7 @@ class PersonalLLM_Slim(nn.Module):
 
         task_embs = self.obtain_task_emb(emb_input_ids, emb_attention_mask, emb_token_type_ids)
         profile_embs = self.obtain_profile_emb(his_id, task_embs)
-        if profile_embs.size(-1) != self.llm_emb_size:
+        if profile_embs.size(-1) != self.llm_emb_size and self.use_align_mlp:
             profile_embs = self.align_mlp(profile_embs)
 
         # --- Session fix ---
@@ -210,8 +236,11 @@ class PersonalLLM_Slim(nn.Module):
         if session_ids is not None:
             batch_np = (self.his_train_memmap if self.training else self.his_dev_memmap)[session_ids.cpu().numpy()]
             session_vecs = self.memmap_to_tensor(batch_np, task_embs.device, requires_grad=True)
-            session_embs = self.session_encoder(session_vecs)[:, -1, :]
-            if session_embs.size(-1) != self.llm_emb_size:
+            if self.use_session_encoder:
+                session_embs = self.session_encoder(session_vecs)[:, -1, :]
+            else:
+                session_embs = session_vecs[:, -1, :]
+            if session_embs.size(-1) != self.llm_emb_size and self.use_align_mlp_session:
                 session_embs = self.align_mlp_session(session_embs)
 
         # --- Graph fix ---
@@ -219,7 +248,7 @@ class PersonalLLM_Slim(nn.Module):
         if self.graph_memmap is not None and graph_node_ids is not None:
             batch_np = self.graph_memmap[graph_node_ids.cpu().numpy()]
             graph_embs = self.memmap_to_tensor(batch_np, task_embs.device, requires_grad=True)
-            if graph_embs.size(-1) != self.llm_emb_size:
+            if graph_embs.size(-1) != self.llm_emb_size and self.use_align_mlp_graph:
                 if graph_embs.dim() == 2:
                     graph_embs = self.align_mlp_graph(graph_embs)
                 else:
@@ -228,14 +257,37 @@ class PersonalLLM_Slim(nn.Module):
 
         # Combine personalization signals
         user_embs_list = []
+        target_dim = self.llm_emb_size
+
+        def _ensure_llm_dim(x: torch.Tensor, align_layer: nn.Module = None):
+            # Helper: make sure embedding last dim == llm_emb_size
+            if x is None:
+                return None
+            if x.size(-1) != target_dim:
+                if align_layer is not None:
+                    return align_layer(x)  # project via provided align_mlp if available
+                else:
+                    # Project on-the-fly via a linear layer if mismatch & no align_mlp
+                    proj = nn.Linear(x.size(-1), target_dim, bias=False).to(x.device).to(x.dtype)
+                    with torch.no_grad():
+                        proj.weight.copy_(torch.eye(target_dim, x.size(-1))[:target_dim])
+                    return proj(x)
+            return x
         if profile_embs is not None:
+            profile_embs = _ensure_llm_dim(profile_embs, getattr(self, "align_mlp", None))
             user_embs_list.append(profile_embs.unsqueeze(1))
         if session_embs is not None:
+            session_embs = _ensure_llm_dim(session_embs, getattr(self, "align_mlp_session", None))
             user_embs_list.append(session_embs.unsqueeze(1))
         if graph_embs is not None:
-            user_embs_list.append(graph_embs)
+            graph_embs = _ensure_llm_dim(graph_embs, getattr(self, "align_mlp_graph", None))
+            if graph_embs.ndim == 2:
+                user_embs_list.append(graph_embs.unsqueeze(1))
+            else:
+                user_embs_list.append(graph_embs)
+
         if not user_embs_list:
-            user_embs_list.append(torch.zeros(task_embs.size(0), 1, self.llm_emb_size, device=task_embs.device))
+            user_embs_list.append(torch.zeros(task_embs.size(0), 1, target_dim, device=task_embs.device))
 
         combined_user_embs = torch.cat(user_embs_list, dim=1)
         fused_task_embs = self.gated_cross_attention(task_embs.unsqueeze(1), combined_user_embs)
@@ -254,11 +306,12 @@ class PersonalLLM_Slim(nn.Module):
         else:
             raise ValueError(f"Unexpected fused_task_embs shape: {fused_task_embs.shape}")
 
-        inst_token_emb = self.align_mlp_inst(self.inst_token).unsqueeze(0).unsqueeze(0)
-        inst_token_emb = inst_token_emb.expand(llm_input_ids.size(0), llm_input_ids.size(1), -1)
-
-        # Add personalization everywhere
-        input_embs = input_embs + fused_task_embs_expanded + inst_token_emb
+        if self.use_inst_token:
+            inst_token_emb = self.align_mlp_inst(self.inst_token).unsqueeze(0).unsqueeze(0) if self.use_align_mlp_inst else self.inst_token.unsqueeze(0).unsqueeze(0)
+            inst_token_emb = inst_token_emb.expand(llm_input_ids.size(0), llm_input_ids.size(1), -1)
+            input_embs = input_embs + fused_task_embs_expanded + inst_token_emb
+        else:
+            input_embs = input_embs + fused_task_embs_expanded
 
         if self.training:
             out = self.llm_model(inputs_embeds=input_embs,
