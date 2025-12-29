@@ -1,7 +1,7 @@
 #!/bin/bash
 
 task_id=3
-epoch=1
+epoch=.1
 len=10
 
 # Optional: check if graph embeddings exist
