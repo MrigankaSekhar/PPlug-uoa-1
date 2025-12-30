@@ -58,10 +58,17 @@ def stratified_subset_pair(q_file, o_file, dst_q_file, dst_o_file, subset_size):
         else:
             subset_questions.extend(random.sample(candidates, take_n))
 
+    # # 🆕 Trim profile history size for each question
+    # for q in subset_questions:
+    #     if "profile" in q and isinstance(q["profile"], list):
+    #         q["profile"] = q["profile"][:MAX_PROFILE_ITEMS]
+
     # 🆕 Trim profile history size for each question
     for q in subset_questions:
         if "profile" in q and isinstance(q["profile"], list):
-            q["profile"] = q["profile"][:MAX_PROFILE_ITEMS]
+            # Pick a random length between 8 and 15
+            max_items = random.randint(8, 15)
+            q["profile"] = q["profile"][:max_items]        
 
     # Shuffle to avoid class order bias
     random.shuffle(subset_questions)

@@ -19,7 +19,7 @@ import datetime
 USE_PROFILE = True   # personalization ON/OFF
 USE_GATE = True      # gating ON/OFF
 TASK_ID = 3          # relevant LaMP task ID
-CHEKPOINT_NUM=69
+CHEKPOINT_NUM=3435
 # Prepare output directory and timestamped file path
 metrics_dir = "./output_3/metrics"
 os.makedirs(metrics_dir, exist_ok=True)

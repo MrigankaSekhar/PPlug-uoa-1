@@ -4,6 +4,7 @@ import json
 import random
 import sys
 import os
+import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from transformers import AutoTokenizer, T5ForConditionalGeneration, AutoModel
@@ -22,7 +23,7 @@ import torch.nn.functional as F
 # === DEBUG TOGGLES ===
 USE_PROFILE = True
 USE_GATE = True
-CHEKPOINT_NUM=69
+CHEKPOINT_NUM=3435
 # Tokenizers
 llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-small", use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained("../bge-base-en-v1.5")
@@ -79,17 +80,37 @@ def get_user_id(profile, idx):
     return profile.get("user_id") or profile.get("user") or f"profileIdx-{idx}"
 
 def compute_profile_embs(his_id, emb_input):
-    """Run model's own task→profile embedding path."""
+    """Run model's own task→profile embedding path.
+       Returns:
+         - Neutral placeholder vector for empty persona (aligned to LLM dim)
+         - Learned vectors from memmap for non-empty persona
+    """
     with torch.no_grad():
         task_embs = model.obtain_task_emb(
             emb_input_ids=emb_input["input_ids"],
             emb_attention_mask=emb_input["attention_mask"],
             emb_token_type_ids=torch.zeros_like(emb_input["input_ids"])
         )
+
+        # Empty history case
+        if his_id.eq(0).all():
+            memmap_src = model.his_train_memmap if model.training else model.his_dev_memmap
+            neutral_vec_np = np.array(memmap_src[1:]).mean(axis=0, dtype=np.float32)  # (768,)
+            neutral_vec = torch.from_numpy(neutral_vec_np).to(his_id.device).float().unsqueeze(0)  # (1,768)
+            
+            # Pass through align MLP if enabled
+            if hasattr(model, "align_mlp") and model.use_align_mlp:
+                neutral_vec = model.align_mlp(neutral_vec)
+
+            return neutral_vec  # now shape matches real_emb (e.g., (1,512))
+
+        # Non-empty case
         return model.obtain_profile_emb(his_id, task_embs)
 
 def run_case(his_id, llm_input, emb_input):
-    """Run inference + return decoded output."""
+    """Run inference + return decoded output.
+       Fallback: if decoded text is blank, run without persona influence or return '[NO_OUTPUT]'.
+    """
     with torch.no_grad():
         _, seqs = model.forward(
             llm_input_ids=llm_input["input_ids"],
@@ -100,7 +121,29 @@ def run_case(his_id, llm_input, emb_input):
             emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
             his_id=his_id
         )
-    return llm_tokenizer.decode(seqs[0], skip_special_tokens=True)
+    pred_text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
+
+    # 🛠 Fallback for blank predictions
+    if not pred_text or pred_text.strip(".") == "":
+        print("[Fallback] Blank output detected — running without persona influence.")
+        his_id_zero = torch.zeros_like(his_id)  # empty persona
+        with torch.no_grad():
+            _, seqs2 = model.forward(
+                llm_input_ids=llm_input["input_ids"],
+                llm_attention_mask=llm_input["attention_mask"],
+                labels=None,
+                emb_input_ids=emb_input["input_ids"],
+                emb_attention_mask=emb_input["attention_mask"],
+                emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
+                his_id=his_id_zero
+            )
+        pred_text = llm_tokenizer.decode(seqs2[0], skip_special_tokens=True).strip()
+
+        # Final safety — if still blank or dots, insert a placeholder
+        if not pred_text or pred_text.strip(".") == "":
+            pred_text = "[NO_OUTPUT]"
+
+    return pred_text
 
 def persona_stats(real_emb, other_emb, other_label):
     cos = F.cosine_similarity(real_emb, other_emb).item()
@@ -108,9 +151,9 @@ def persona_stats(real_emb, other_emb, other_label):
 
 # --- Query sets ---
 unseen_queries = [
-    ("UNSEEN", "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The headphones arrived quickly and were packaged well. Sound quality is good for the price, although the ear pads feel a bit cheap.",
+    ("UNSEEN", "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The headphones arrived quickly and were packaged well. Sound quality is good for the price, although the ear pads feel a bit cheap。",
      random.randrange(len(profiles))),
-    ("UNSEEN", "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The book was fast-paced and entertaining, but some plot points were predictable. Still enjoyed it overall.",
+    ("UNSEEN", "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The book was fast-paced and entertaining, but some plot points were predictable. Still enjoyed it overall。",
      random.randrange(len(profiles)))
 ]
 

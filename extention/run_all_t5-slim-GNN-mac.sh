@@ -1,7 +1,7 @@
 #!/bin/bash
 
 task_id=3
-epoch=.1
+epoch=5
 len=10
 
 # Optional: check if graph embeddings exist
@@ -19,7 +19,7 @@ LOG_FILE="./log/output_mac_${task_id}_${timestamp}.log"
 
 # Run without deepspeed, on CPU, writing full output to log file
 python main_profile-slim-GNN.py \
-    --model_path ../FlanT5-small/ \
+    --model_path ../FlanT5-Large/ \
     --emb_model_path ../bge-base-en-v1.5/ \
     --train_file ../LaMP_time_${task_id}_subset_id/train_aug_input.json \
     --dev_file ../LaMP_time_${task_id}_subset_id/dev_profile.json \
