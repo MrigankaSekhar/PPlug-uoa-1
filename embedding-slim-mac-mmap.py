@@ -105,8 +105,10 @@ for split in ["train", "dev"]:
 
     for i in tqdm(range(0, len(texts_chunk), args.batch_size), desc="Embedding", unit="batch"):
         batch_texts = texts_chunk[i:i+args.batch_size]
+        # ✅ Clamp max_length safely to avoid token overflow warnings
+        safe_max_len = min(args.max_length, tokenizer.model_max_length)       
         enc = tokenizer(batch_texts, padding=True, truncation=True,
-                        max_length=args.max_length, return_tensors="pt")
+                        max_length=safe_max_len, return_tensors="pt")
         
         # Keep integer types for ids, mask, and token type ids
         for k, v in enc.items():
