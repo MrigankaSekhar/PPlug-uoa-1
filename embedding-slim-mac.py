@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
+# ✅ Subset toggle
+USE_SUBSET = True  # change to False to use full dataset
+
 # -----------------------------
 # DEVICE & PERFORMANCE SETTINGS
 # -----------------------------
@@ -184,7 +187,12 @@ def get_embedding_streaming(sentences, save_path, batch_size=64, max_length=512,
 os.makedirs("./bge_emb", exist_ok=True)
 
 for idx in [3]:
-    dir_name = f"LaMP_time_{idx}"
+    if USE_SUBSET:
+        dir_name = f"LaMP_time_{idx}_subset"
+    else:
+        dir_name = f"LaMP_time_{idx}"
+
+    print(f"📄 Dataset directory: {dir_name}")
 
     print(f"Processing TRAIN set: {dir_name}")
     dataset = json.load(open(os.path.join(dir_name, "train_questions.json")))

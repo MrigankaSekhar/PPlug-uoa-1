@@ -5,6 +5,7 @@ import copy
 from tqdm import tqdm
 import random
 
+USE_SUBSET = True 
 
 def process(idx, entry) :
     question = entry["input"]
@@ -125,11 +126,15 @@ remove_chars = '[·’!"\#$%&\'()＃！（）*+,-./:;<=>?\@，：?￥★、…�
 #     if (idx == 6) :
 #         continue
 for idx in [3]:  
-    dir_name = "LaMP_time_" + str(idx)
-    file_name = os.path.join(dir_name, "train_questions.json")
+    dir_name = f"LaMP_time_{idx}"
+    subset_dir = f"{dir_name}_subset"
+    data_dir = subset_dir if USE_SUBSET else dir_name
+
+    file_name = os.path.join(data_dir, "train_questions.json")
+    print(f"Using TRAIN questions from: {file_name}")
     print(file_name)
     dataset = json.load(open(file_name))
-    os.mkdir(dir_name + "_id")
+    os.mkdir(data_dir + "_id")
 
     datas = []
     
@@ -149,7 +154,7 @@ for idx in [3]:
         datas += [output_entry]
 
     
-    file_name = os.path.join(dir_name, "train_outputs.json")
+    file_name = os.path.join(data_dir, "train_outputs.json")
     print(file_name)
     outputs = json.load(open(file_name))
 
@@ -162,7 +167,7 @@ for idx in [3]:
         cnt += 1
             
     
-    f_out = open(os.path.join(dir_name + "_id", "train_aug_input.json"),"w")
+    f_out = open(os.path.join(data_dir + "_id", "train_aug_input.json"),"w")
     for data in datas:
         if (len(data["his_id"]) > 2) :
             for times in range(10) :
@@ -178,9 +183,12 @@ for idx in [3]:
 #     if (idx == 6) :
 #         continue
 for idx in [3]:   # only process LaMP-3 for dev set    
-    dir_name = "LaMP_time_" + str(idx)
-    file_name = os.path.join(dir_name, "dev_questions.json")
-    print(file_name)
+    dir_name = f"LaMP_time_{idx}"
+    subset_dir = f"{dir_name}_subset"
+    data_dir = subset_dir if USE_SUBSET else dir_name
+
+    file_name = os.path.join(data_dir, "dev_questions.json")
+    print(f"Using DEV questions from: {file_name}")
     dataset = json.load(open(file_name))
 
     datas = []
@@ -201,7 +209,7 @@ for idx in [3]:   # only process LaMP-3 for dev set
         datas += [output_entry]
 
     
-    file_name = os.path.join(dir_name, "dev_outputs.json")
+    file_name = os.path.join(data_dir, "dev_outputs.json")
     print(file_name)
     outputs = json.load(open(file_name))
 
@@ -214,6 +222,6 @@ for idx in [3]:   # only process LaMP-3 for dev set
         cnt += 1
             
     
-    f_out = open(os.path.join(dir_name + "_id", "dev_profile.json"),"w")
+    f_out = open(os.path.join(data_dir + "_id", "dev_profile.json"),"w")
     for data in datas:
         f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
