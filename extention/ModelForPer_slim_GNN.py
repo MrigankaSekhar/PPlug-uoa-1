@@ -17,8 +17,8 @@ class PersonalLLM_Slim(nn.Module):
                  use_inst_token=True,
                  use_align_mlp_inst=True,
                  use_align_mlp=True,
-                 use_session_encoder=True,
-                 use_align_mlp_session=True,
+                 use_session_encoder=False,
+                 use_align_mlp_session=False,
                  use_align_mlp_graph=True,
                  use_cross_attn=True,
                  use_gate=True,):
@@ -321,11 +321,24 @@ class PersonalLLM_Slim(nn.Module):
                                  return_dict=True)
             return SequenceClassifierOutput(loss=out.loss)
         else:
-            out = self.llm_model.generate(inputs_embeds=input_embs,
-                                          attention_mask=llm_attention_mask,
-                                          max_new_tokens=self.max_new_len,
-                                          num_beams=4,
-                                          num_return_sequences=1,
-                                          return_dict_in_generate=True,
-                                          do_sample=False)
-            return [torch.FloatTensor([0.0]).to(llm_input_ids.device), out['sequences']]
+           # ✅ Compute real loss during eval
+            eval_out = self.llm_model(
+                inputs_embeds=input_embs,
+                attention_mask=llm_attention_mask.long(),
+                labels=labels.long(),
+                use_cache=False,
+                return_dict=True
+            )
+            loss = eval_out.loss
+
+            # Generate sequences for metrics
+            gen_out = self.llm_model.generate(
+                inputs_embeds=input_embs,
+                attention_mask=llm_attention_mask,
+                max_new_tokens=self.max_new_len,
+                num_beams=4,
+                num_return_sequences=1,
+                return_dict_in_generate=True,
+                do_sample=False
+            )
+            return [loss, gen_out['sequences']]

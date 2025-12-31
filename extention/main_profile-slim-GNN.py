@@ -69,6 +69,11 @@ def train_model(model_args, data_args, training_args):
         predictions = llm_tokenizer.batch_decode(preds, skip_special_tokens=True)
         references = llm_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
+        # 🔹 DEBUG LOGGING
+        print("\n[DEBUG] Evaluation Predictions vs References")
+        for i, (p, r) in enumerate(zip(predictions[:10], references[:10])):
+            print(f"Sample {i}: PRED='{p}' | REF='{r}'")
+
         def create_mapping(x):
             try:
                 return float(x)
