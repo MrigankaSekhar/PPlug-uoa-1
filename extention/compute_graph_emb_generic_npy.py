@@ -22,7 +22,7 @@ import sys, os
 
 USE_SUBSET = True
 
-GRAPHSAGE_EPOCHS = 5
+GRAPHSAGE_EPOCHS = 50
 GRAPHSAGE_HIDDEN_DIM = 256
 TASK_ID = 3
 
@@ -386,7 +386,7 @@ def train_gnn():
             self.alpha = alpha
             self.conv1 = SAGEConv(in_c, h_c)
             self.conv2 = SAGEConv(h_c, out_c)
-            self.dropout = nn.Dropout(0.2)
+            self.dropout = nn.Dropout(0.3)
 
         def forward(self, x, edge_index, edge_weight=None):
             # Pass edge_weight if supported
@@ -463,7 +463,7 @@ def infer_gnn():
     x_tensor = torch.tensor(x_array.astype(np.float32))
     data_obj = Data(x=x_tensor, edge_index=edge_index, edge_attr=edge_weight).to(device)
 
-    ALPHA = 0.2  # must match training
+    ALPHA = 0.02  # must match training
 
     class GraphSAGE(torch.nn.Module):
         def __init__(self, in_c, h_c, out_c, alpha):

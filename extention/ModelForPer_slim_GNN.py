@@ -17,8 +17,8 @@ class PersonalLLM_Slim(nn.Module):
                  use_inst_token=True,
                  use_align_mlp_inst=True,
                  use_align_mlp=True,
-                 use_session_encoder=False,
-                 use_align_mlp_session=False,
+                 use_session_encoder=True,
+                 use_align_mlp_session=True,
                  use_align_mlp_graph=True,
                  use_cross_attn=True,
                  use_gate=True,):
