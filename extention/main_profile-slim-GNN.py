@@ -60,7 +60,17 @@ class DataArguments:
 def train_model(model_args, data_args, training_args):
 
     llm_tokenizer = T5Tokenizer.from_pretrained(model_args.model_path)
+    llm_tokenizer.model_max_length = data_args.max_input_len
     emb_tokenizer = AutoTokenizer.from_pretrained(model_args.emb_model_path)
+    emb_tokenizer.model_max_length = data_args.max_input_len
+
+    llm_model_loaded = transformers.T5ForConditionalGeneration.from_pretrained(model_args.model_path)
+
+    # ✅ Force config limits to match dataset cropping for no token-length warning
+    llm_model_loaded.config.n_positions = data_args.max_input_len
+    llm_model_loaded.config.max_position_embeddings = data_args.max_input_len
+    llm_model_loaded.config.model_max_length = data_args.max_input_len
+
 
     def compute_metrics_classification(eval_preds):
         preds, labels = eval_preds
@@ -107,8 +117,10 @@ def train_model(model_args, data_args, training_args):
     )
 
     task_id = int(training_args.output_dir.split("_")[-1])
+
+
     model = PersonalLLM_Slim(
-        llm_model=transformers.T5ForConditionalGeneration.from_pretrained(model_args.model_path),
+        llm_model=llm_model_loaded,
         emb_model=emb_model,
         max_input_len=data_args.max_input_len,
         max_new_len=data_args.max_new_len,

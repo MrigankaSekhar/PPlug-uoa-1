@@ -170,6 +170,8 @@ class PersonalLLM_Slim(nn.Module):
         """
         Convert a NumPy memmap slice to float32 torch tensor on target device.
         """
+        if not np_array.flags.writeable:
+            np_array = np_array.copy()  # ✅ create writable ndarray
         tensor = torch.from_numpy(np_array).to(device).float()
         tensor.requires_grad = requires_grad
         return tensor
@@ -222,67 +224,132 @@ class PersonalLLM_Slim(nn.Module):
         else:
             return attn_out
 
+
     def forward(self, llm_input_ids, llm_attention_mask, labels,
                 emb_input_ids, emb_attention_mask, emb_token_type_ids,
                 his_id, session_ids=None, graph_node_ids=None):
 
         task_embs = self.obtain_task_emb(emb_input_ids, emb_attention_mask, emb_token_type_ids)
-        profile_embs = self.obtain_profile_emb(his_id, task_embs)
-        if profile_embs.size(-1) != self.llm_emb_size and self.use_align_mlp:
-            profile_embs = self.align_mlp(profile_embs)
-
-        # --- Session fix ---
+        profile_embs = None
         session_embs = None
+        graph_embs = None
+
+        # Detect if we are on GPU and in eval mode → can downcast to fp16
+        use_fp16_cache = (not self.training) and (task_embs.device.type == "cuda")
+
+        # ==========================================================
+        # 🔹 1) COLLECT ALL UNIQUE IDS FOR HISTORY + SESSION + GRAPH
+        # ==========================================================
+        id_tensors = []
+        if his_id is not None:
+            id_tensors.append(his_id.view(-1))
         if session_ids is not None:
-            batch_np = (self.his_train_memmap if self.training else self.his_dev_memmap)[session_ids.cpu().numpy()]
-            session_vecs = self.memmap_to_tensor(batch_np, task_embs.device, requires_grad=True)
-            if self.use_session_encoder:
-                session_embs = self.session_encoder(session_vecs)[:, -1, :]
+            id_tensors.append(session_ids.view(-1))
+        if graph_node_ids is not None:
+            id_tensors.append(graph_node_ids.view(-1))
+
+        if id_tensors:
+            all_ids = torch.unique(torch.cat(id_tensors)).cpu().numpy()
+        else:
+            all_ids = np.array([], dtype=np.int64)
+
+        # ==========================================================
+        # 🔹 2) LOAD MEMMAP SLICES ONCE PER SOURCE TYPE INTO CACHE
+        # ==========================================================
+        def maybe_fp16(t: torch.Tensor) -> torch.Tensor:
+            """Downcast to float16 if on CUDA eval mode."""
+            return t.half() if use_fp16_cache else t
+
+        # History/session share same memmap
+        if all_ids.size > 0:
+            his_memmap_src = self.his_train_memmap if self.training else self.his_dev_memmap
+            his_cache = {
+                id_val: maybe_fp16(self.memmap_to_tensor(
+                    his_memmap_src[id_val], task_embs.device, requires_grad=True
+                ))
+                for id_val in all_ids if id_val < len(his_memmap_src)
+            }
+        else:
+            his_cache = {}
+
+        # Graph memmap cache
+        graph_cache = {}
+        if self.graph_memmap is not None and graph_node_ids is not None:
+            unique_graph_ids = torch.unique(graph_node_ids.view(-1)).cpu().numpy()
+            graph_cache = {
+                id_val: maybe_fp16(self.memmap_to_tensor(
+                    self.graph_memmap[id_val], task_embs.device, requires_grad=True
+                ))
+                for id_val in unique_graph_ids if id_val < len(self.graph_memmap)
+            }
+        # ==========================================================
+        # 🔹 3) RETRIEVE PROFILE EMBEDDINGS FROM CACHE
+        # ==========================================================
+        if his_id is not None:
+            his_embs = torch.stack([his_cache[i.item()] for i in his_id.view(-1)])
+            his_embs = his_embs.view(his_id.size(0), his_id.size(1), -1)
+            if self.use_align_mlp:
+                align_first: nn.Linear = self.align_mlp[0]
+                target_dtype = align_first.weight.dtype
+                his_embs = his_embs.to(dtype=target_dtype)
+                his_embs_align = self.align_mlp(his_embs).view(his_id.size(0), -1, self.llm_emb_size)
             else:
-                session_embs = session_vecs[:, -1, :]
+                his_embs_align = his_embs
+
+            task_embs_raw = self._last_task_vecs_raw
+            his_mask = torch.eq(his_id, 0)
+            his_mask = his_mask.repeat(1, self.mult_k).view(his_id.size(0) * self.mult_k, -1)
+            his_weight = torch.bmm(his_embs, task_embs_raw.unsqueeze(-1))
+            his_weight = his_weight.masked_fill(his_mask.unsqueeze(-1), -torch.inf)
+            his_weight = torch.nn.functional.softmax(his_weight, dim=1)
+            profile_embs = torch.bmm(his_embs_align.transpose(1, 2), his_weight).squeeze(-1)
+
+        # ==========================================================
+        # 🔹 4) SESSION EMBEDDINGS FROM SAME CACHE
+        # ==========================================================
+        if session_ids is not None:
+            sess_embs = torch.stack([his_cache[i.item()] for i in session_ids.view(-1)])
+            sess_embs = sess_embs.view(session_ids.size(0), session_ids.size(1), -1)
+            if self.use_session_encoder:
+                session_embs = self.session_encoder(sess_embs)[:, -1, :]
+            else:
+                session_embs = sess_embs[:, -1, :]
             if session_embs.size(-1) != self.llm_emb_size and self.use_align_mlp_session:
                 session_embs = self.align_mlp_session(session_embs)
 
-        # --- Graph fix ---
-        graph_embs = None
+        # ==========================================================
+        # 🔹 5) GRAPH EMBEDDINGS FROM GRAPH CACHE
+        # ==========================================================
         if self.graph_memmap is not None and graph_node_ids is not None:
-            batch_np = self.graph_memmap[graph_node_ids.cpu().numpy()]
-            graph_embs = self.memmap_to_tensor(batch_np, task_embs.device, requires_grad=True)
-            if graph_embs.size(-1) != self.llm_emb_size and self.use_align_mlp_graph:
-                if graph_embs.dim() == 2:
-                    graph_embs = self.align_mlp_graph(graph_embs)
+            g_embs = torch.stack([graph_cache[i.item()] for i in graph_node_ids.view(-1)])
+            if graph_node_ids.ndim > 1:
+                g_embs = g_embs.view(graph_node_ids.size(0), graph_node_ids.size(1), -1)
+            if g_embs.size(-1) != self.llm_emb_size and self.use_align_mlp_graph:
+                if g_embs.dim() == 2:
+                    g_embs = self.align_mlp_graph(g_embs)
                 else:
-                    bsz, seq_len, dim = graph_embs.size()
-                    graph_embs = self.align_mlp_graph(graph_embs.view(-1, dim)).view(bsz, seq_len, -1)
+                    bsz, seq_len, dim = g_embs.size()
+                    g_embs = self.align_mlp_graph(g_embs.view(-1, dim)).view(bsz, seq_len, -1)
+            graph_embs = g_embs
 
-        # Combine personalization signals
+        # ==========================================================
+        # 🔹 6) COMBINE SIGNALS + CONTINUE EXACTLY LIKE BEFORE
+        # ==========================================================
         user_embs_list = []
         target_dim = self.llm_emb_size
-
         def _ensure_llm_dim(x: torch.Tensor, align_layer: nn.Module = None):
-            # Helper: make sure embedding last dim == llm_emb_size
-            if x is None:
-                return None
+            if x is None: return None
             if x.size(-1) != target_dim:
-                if align_layer is not None:
-                    return align_layer(x)  # project via provided align_mlp if available
-                else:
-                    # Project on-the-fly via a linear layer if mismatch & no align_mlp
-                    proj = nn.Linear(x.size(-1), target_dim, bias=False).to(x.device).to(x.dtype)
-                    with torch.no_grad():
-                        proj.weight.copy_(torch.eye(target_dim, x.size(-1))[:target_dim])
-                    return proj(x)
+                return align_layer(x) if align_layer is not None else x
             return x
+
         if profile_embs is not None:
-            profile_embs = _ensure_llm_dim(profile_embs, getattr(self, "align_mlp", None))
-            user_embs_list.append(profile_embs.unsqueeze(1))
+            user_embs_list.append(_ensure_llm_dim(profile_embs, getattr(self, "align_mlp", None)).unsqueeze(1))
         if session_embs is not None:
-            session_embs = _ensure_llm_dim(session_embs, getattr(self, "align_mlp_session", None))
-            user_embs_list.append(session_embs.unsqueeze(1))
+            user_embs_list.append(_ensure_llm_dim(session_embs, getattr(self, "align_mlp_session", None)).unsqueeze(1))
         if graph_embs is not None:
-            graph_embs = _ensure_llm_dim(graph_embs, getattr(self, "align_mlp_graph", None))
             if graph_embs.ndim == 2:
-                user_embs_list.append(graph_embs.unsqueeze(1))
+                user_embs_list.append(_ensure_llm_dim(graph_embs, getattr(self, "align_mlp_graph", None)).unsqueeze(1))
             else:
                 user_embs_list.append(graph_embs)
 

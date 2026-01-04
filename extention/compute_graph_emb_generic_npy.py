@@ -6,7 +6,6 @@ import argparse
 import torch
 import gc
 import numpy as np
-import itertools
 from typing import Optional, Dict, Tuple
 from tqdm import tqdm
 from torch_geometric.data import Data
@@ -14,27 +13,30 @@ from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
 from transformers import AutoTokenizer, AutoModel
 import torch.nn as nn
-import sys, os
-
+import sys
+from nltk.sentiment import SentimentIntensityAnalyzer
+import nltk
+try:
+    from nltk.sentiment import SentimentIntensityAnalyzer
+except LookupError:
+    nltk.download('vader_lexicon')
+    from nltk.sentiment import SentimentIntensityAnalyzer
 # -----------------------------
 # CONFIG
 # -----------------------------
-
 USE_SUBSET = True
-
-GRAPHSAGE_EPOCHS = 50
+GRAPHSAGE_EPOCHS = 10
 GRAPHSAGE_HIDDEN_DIM = 256
 TASK_ID = 3
 
 DEV_DATASET_FOLDER_SUBSET = f"LaMP_time_{TASK_ID}_subset"
 FULL_DATASET_FOLDER = f"LaMP_time_{TASK_ID}"
 
-
 GRAPH_DIR = "../graph_emb"
 os.makedirs(GRAPH_DIR, exist_ok=True)
 SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_graph.npy")
 MAP_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph.json")
-# ✅ Pick dataset paths based on subset/full config
+
 if USE_SUBSET:
     TRAIN_FILE = os.path.join("..", DEV_DATASET_FOLDER_SUBSET, "train_questions.json")
     DEV_FILE   = os.path.join("..", DEV_DATASET_FOLDER_SUBSET, "dev_questions.json")
@@ -45,27 +47,31 @@ else:
 print(f"📄 TRAIN_FILE = {TRAIN_FILE}")
 print(f"📄 DEV_FILE   = {DEV_FILE}")
 
+# -----------------------------
+# NEW SCHEMA with Sentiment & Popularity
+# -----------------------------
 SCHEMA = [
     ("User", "Item", "RATED"),
     ("User", "Review", "WROTE"),
     ("Review", "Item", "DESCRIBES"),
-    ("Item", "Category", "BELONGS_TO"),
+    ("Review", "Sentiment", "HAS_POLARITY"),
+    ("Item", "Popularity", "HAS_POP"),
 ]
 
-# Relation weights (Option 1)
 REL_WEIGHT = {
     "RATED":        1.00,
     "WROTE":        1.20,
     "DESCRIBES":    0.80,
-    "BELONGS_TO":   0.60,
+    "HAS_POLARITY": 0.70,
+    "HAS_POP":      0.50,
 }
 
-# Field map (if you later add more)
 FIELD_MAP = {
     "User":     "user_id",
     "Item":     "item_id",
-    "Review":   "review_text",   # We will override from 'input' and 'profile[*].text'
-    "Category": "category",
+    "Review":   "review_text",
+    "Sentiment": "sentiment",
+    "Popularity": "popularity_level",
 }
 
 FEATURE_INIT = "bge"
@@ -75,6 +81,9 @@ BGE_OUTPUT_DIM = 768
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
+# Sentiment analyzer (rule-based, works offline)
+sia = SentimentIntensityAnalyzer()
 
 # -----------------------------
 # UTILS
@@ -88,29 +97,36 @@ def load_json_lines(path):
             return json.load(f)
 
 def _extract_review_from_input(inp: str) -> str:
-    """Extract review text from the 'input' field if it contains 'review:'."""
-    if not isinstance(inp, str):
-        return ""
+    if not isinstance(inp, str): return ""
     low = inp.lower()
     k = low.find("review:")
     return inp[k+len("review:"):].strip() if k >= 0 else inp.strip()
 
+def text_to_sentiment(text: str) -> Optional[str]:
+    """Derive sentiment bucket from review text using VADER compound score."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    score = sia.polarity_scores(text)['compound']
+    if score >= 0.2:
+        return "Positive"
+    elif score <= -0.2:
+        return "Negative"
+    else:
+        return "Neutral"
+
 # -----------------------------
-# BUILD GRAPH (global IDs)
+# GRAPH BUILD
 # -----------------------------
-# One global ID space to avoid collisions and memmap gaps
-node_index: Dict[Tuple[str, str], int] = {}    # (type, key) -> global_id
+node_index: Dict[Tuple[str, str], int] = {}
 node_maps: Dict[str, Dict[str, int]] = {t: {} for t, _, _ in SCHEMA} | {t: {} for _, t, _ in SCHEMA}
 node_key_texts: Dict[str, Dict[str, str]] = {t: {} for t, _, _ in SCHEMA} | {t: {} for _, t, _ in SCHEMA}
 next_id = 0
-
-edges = []       # list[(src_id, tgt_id)]
-edge_wts = []    # list[float] (relation-aware weights)
-
-his_to_graph = {}  # maps profile 'id' (string) -> global review node id
+edges = []
+edge_wts = []
+his_to_graph = {}
+item_freq = {}  # For popularity binning
 
 def add_node(typ: str, key: str, text: Optional[str] = None) -> int:
-    """Create or fetch a global node ID; store text if provided."""
     global next_id
     if (typ, key) not in node_index:
         node_index[(typ, key)] = next_id
@@ -121,50 +137,55 @@ def add_node(typ: str, key: str, text: Optional[str] = None) -> int:
     return node_index[(typ, key)]
 
 def add_edge(src_id: int, tgt_id: int, rel: str):
-    """Append undirected edges with relation weight."""
     w = REL_WEIGHT.get(rel, 1.0)
     edges.append((src_id, tgt_id)); edge_wts.append(w)
     edges.append((tgt_id, src_id)); edge_wts.append(w)
 
-
+def get_popularity_bucket(item_key: str) -> str:
+    """Map item frequency to a coarse bucket."""
+    freq = item_freq.get(item_key, 0)
+    if freq >= 10:
+        return "HighPop"
+    elif freq >= 3:
+        return "MedPop"
+    else:
+        return "LowPop"
 
 def process_entry(entry: dict, from_train: bool = True):
-    # Question-level nodes
+    # User node
     user_key = entry.get("user_id") or f"user_{entry.get('id')}"
-    user_text = f"User {user_key}"
+    user_id = add_node("User", user_key, f"User {user_key}")
 
-    # Review text from 'input' — only embed for train entries to avoid test leakage
-    review_text_q = ""
-    if from_train:
-        review_text_q = _extract_review_from_input(entry.get("input", ""))
-    else:
-        # 🔍 Debug message for leakage check
-        print(f"⚠️ Skipping question review text for dev entry id={entry.get('id')}")
-
+    # Review node for the query
     review_key_q = f"review_{entry.get('id')}"
-
-    # Synthetic item (no item_title present)
-    item_key_q = f"item_{entry.get('id')}"
-    item_text_q = f"Item for question {entry.get('id')}"
-
-    user_id = add_node("User", user_key, user_text)
-
-    # Only include review text if from train set
+    review_text_q = _extract_review_from_input(entry.get("input", "")) if from_train else None
     review_id_q = add_node("Review", review_key_q, review_text_q if from_train else None)
-    item_id_q = add_node("Item", item_key_q, item_text_q)
 
-    # Wire edges (respect SCHEMA)
+    # Item node (synthetic)
+    item_key_q = f"item_{entry.get('id')}"
+    item_id_q = add_node("Item", item_key_q, f"Item for question {entry.get('id')}")
+
+    # Count for popularity
+    item_freq[item_key_q] = item_freq.get(item_key_q, 0) + 1
+
+    # Core edges
     add_edge(user_id, review_id_q, "WROTE")
     add_edge(review_id_q, item_id_q, "DESCRIBES")
     add_edge(user_id, item_id_q, "RATED")
 
-    # Category only if present
-    cat = entry.get("category")
-    if cat:
-        cat_id = add_node("Category", str(cat), str(cat))
-        add_edge(item_id_q, cat_id, "BELONGS_TO")
+    # Sentiment edge for query
+    if review_text_q:
+        bucket = text_to_sentiment(review_text_q)
+        if bucket:
+            sent_id = add_node("Sentiment", bucket, bucket)
+            add_edge(review_id_q, sent_id, "HAS_POLARITY")
 
-    # Profile reviews (history)
+    # Popularity edge for query
+    pop_bucket = get_popularity_bucket(item_key_q)
+    pop_id = add_node("Popularity", pop_bucket, pop_bucket)
+    add_edge(item_id_q, pop_id, "HAS_POP")
+
+    # Profile history reviews
     if "profile" in entry and isinstance(entry["profile"], list):
         for his in entry["profile"]:
             hid = str(his.get("id"))
@@ -173,84 +194,65 @@ def process_entry(entry: dict, from_train: bool = True):
             add_edge(user_id, p_review_id, "WROTE")
             his_to_graph[hid] = p_review_id
 
-            # Synthetic item per profile review (optional)
+            # Link profile review to sentiment
+            bucket = text_to_sentiment(his_text)
+            if bucket:
+                sent_id = add_node("Sentiment", bucket, bucket)
+                add_edge(p_review_id, sent_id, "HAS_POLARITY")
+
+            # Synthetic item for profile review
             p_item_key = f"item_{hid}"
             p_item_id = add_node("Item", p_item_key, f"Item (profile {hid})")
             add_edge(p_review_id, p_item_id, "DESCRIBES")
             add_edge(user_id, p_item_id, "RATED")
 
-# Load & slice data
+            # Popularity edge
+            item_freq[p_item_key] = item_freq.get(p_item_key, 0) + 1
+            pop_bucket = get_popularity_bucket(p_item_key)
+            pop_id = add_node("Popularity", pop_bucket, pop_bucket)
+            add_edge(p_item_id, pop_id, "HAS_POP")
+
+# -----------------------------
+# Load data
+# -----------------------------
 train_data = load_json_lines(TRAIN_FILE)
 dev_data = load_json_lines(DEV_FILE)
 
-# if USE_SUBSET and SUBSET_SIZE_JSON and SUBSET_SIZE_JSON > 0:
-#     print(f"⚠️ Using subset mode for JSON data: first {SUBSET_SIZE_JSON} entries from train & dev")
-#     train_data = train_data[:SUBSET_SIZE_JSON]
-#     dev_data   = dev_data[:SUBSET_SIZE_JSON]
+# First pass to count item frequencies
+print("📊 Counting item frequencies...")
+for entry in tqdm(train_data + dev_data, desc="Counting items", unit="entry"):
+    # synthetic item ID matches how process_entry will name it
+    item_key_q = f"item_{entry.get('id')}"
+    item_freq[item_key_q] = item_freq.get(item_key_q, 0) + 1
+    if "profile" in entry:
+        for his in entry["profile"]:
+            p_item_key = f"item_{str(his.get('id'))}"
+            item_freq[p_item_key] = item_freq.get(p_item_key, 0) + 1
 
-# for entry in itertools.chain(train_data, dev_data):
-#     process_entry(entry)
-
-# -----------------------------
-# SUBSET FILTERING (limit nodes)
-# -----------------------------
-# if USE_SUBSET and SUBSET_SIZE_GRAPH_EMBED_NODES and SUBSET_SIZE_GRAPH_EMBED_NODES > 0:
-#     print(f"⚡ SUBSET MODE: reducing graph to first {SUBSET_SIZE_GRAPH_EMBED_NODES} nodes")
-#     # Allowed nodes are the first N by global id (deterministic)
-#     all_ids_sorted = sorted(node_index.values())
-#     allowed_nodes = set(all_ids_sorted[:SUBSET_SIZE_GRAPH_EMBED_NODES])
-
-#     # Filter per-type maps
-#     for typ in list(node_maps.keys()):
-#         node_maps[typ] = {k: v for k, v in node_maps[typ].items() if v in allowed_nodes}
-
-#     # Filter node_key_texts at key level
-#     for typ in list(node_key_texts.keys()):
-#         node_key_texts[typ] = {k: t for k, t in node_key_texts[typ].items()
-#                                if node_maps[typ].get(k) in allowed_nodes}
-
-#     # Filter edges + weights together
-#     new_edges, new_wts = [], []
-#     for (s, t), w in zip(edges, edge_wts):
-#         if s in allowed_nodes and t in allowed_nodes:
-#             new_edges.append((s, t)); new_wts.append(w)
-#     edges, edge_wts = new_edges, new_wts
-
-#     # Filter his_to_graph
-#     his_to_graph = {k: v for k, v in his_to_graph.items() if v in allowed_nodes}
-
-
-# -----------------------------
-# Process train entries (include question review text)
-# -----------------------------
-for entry in train_data:
+# Second pass to build nodes/edges
+print("🏗 Building graph from TRAIN set...")
+for entry in tqdm(train_data, desc="Processing train_data", unit="entry"):
     process_entry(entry, from_train=True)
 
-# -----------------------------
-# Process dev entries (skip question review text to avoid leakage)
-# -----------------------------
-for entry in dev_data:
+print("🏗 Building graph from DEV set...")
+for entry in tqdm(dev_data, desc="Processing dev_data", unit="entry"):
     process_entry(entry, from_train=False)
 
 # -----------------------------
-# ID COMPACTION (critical for dev)
+# COMPACT IDs and build tensors (same logic as original)
 # -----------------------------
-# Compact remaining IDs to 0..K-1 before creating any memmaps
 remaining_ids = set()
 for m in node_maps.values():
     remaining_ids.update(m.values())
 for s, t in edges:
     remaining_ids.add(s); remaining_ids.add(t)
 
-id_list_sorted = sorted(remaining_ids)
-old2new = {old: new for new, old in enumerate(id_list_sorted)}
-num_nodes = len(id_list_sorted)  # compact count
+old2new = {old: new for new, old in enumerate(sorted(remaining_ids))}
+num_nodes = len(old2new)
 
-# Remap node_maps (per-type)
 for typ in list(node_maps.keys()):
     node_maps[typ] = {k: old2new[v] for k, v in node_maps[typ].items() if v in old2new}
 
-# Build id->text from node_key_texts (new IDs)
 node_texts = {}
 for typ, mapping in node_maps.items():
     for key, new_id in mapping.items():
@@ -258,19 +260,15 @@ for typ, mapping in node_maps.items():
         if isinstance(txt, str) and txt.strip():
             node_texts[new_id] = txt.strip()
 
-# Remap edges (order preserved so weights align)
-edges = [(old2new[s], old2new[t]) for (s, t) in edges if s in old2new and t in old2new]
-# edge_wts already aligned with edges during prior filtering; order unchanged
-
-# Remap his_to_graph
+edges = [(old2new[s], old2new[t]) for (s, t) in edges]
 his_to_graph = {k: old2new[v] for k, v in his_to_graph.items() if v in old2new}
 
-# Build tensors from compact IDs
-edge_index_list = [(s, t) for (s, t) in edges]
-edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 edge_weight = torch.tensor(edge_wts, dtype=torch.float)
 
 print(f"📊 COMPACT graph: {num_nodes} nodes; edges={len(edges)}")
+
+# === Rest of embed/train/infer functions stay exactly as your original ===
 
 # -----------------------------
 # PATHS
@@ -290,7 +288,12 @@ def _mean_pool(last_hidden_state, attention_mask):
     denom = mask.sum(dim=1).clamp(min=1e-9)
     return summed / denom
 
+
 def embed_chunk(chunk_index, num_chunks):
+    """
+    Embeds graph nodes that have associated text using the BGE model.
+    Reuses precomputed his_embed vectors for Review nodes via his_to_graph.
+    """
     start_time_all = time.time()
 
     if os.path.exists(PARTIAL_X_PATH):
@@ -304,67 +307,133 @@ def embed_chunk(chunk_index, num_chunks):
                       shape=(num_nodes, EMB_DIM))
         processed_ids = set()
 
+    # --- 1️⃣ Load precomputed his_embed table ---
+    # Adjust to your actual his_embed path (should match profile emb table file)
+    his_embed_path = "../bge_emb/task_3_dev_bge.npy"
+    if os.path.exists(his_embed_path):
+        if his_embed_path.endswith(".npy"):
+            his_embed_table = np.load(his_embed_path)
+        else:
+            his_embed_table = torch.load(his_embed_path, map_location="cpu").numpy()
+        print(f"📂 Loaded his_embed table from {his_embed_path} shape={his_embed_table.shape}")
+        # Populate Review nodes directly
+        assign_count = 0
+        for his_id_str, node_id in his_to_graph.items():
+            his_id = int(his_id_str)
+            if his_id < his_embed_table.shape[0]:
+                x[node_id] = his_embed_table[his_id].astype(np.float16)
+                processed_ids.add(node_id)
+                assign_count += 1
+        print(f"✅ Assigned {assign_count} Review node embeddings from precomputed his_embed")
+    else:
+        print(f"⚠️ his_embed_path '{his_embed_path}' not found — falling back to BGE for all nodes.")
+
+    # --- 2️⃣ Continue with BGE for the rest of node_texts (non‑Review) ---
     tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_PATH)
     model = AutoModel.from_pretrained(BGE_MODEL_PATH, torch_dtype=torch.float32).to(device).eval()
 
-    # Nodes that actually have text
-    text_nodes_all = sorted([(txt, gid) for gid, txt in node_texts.items()], key=lambda p: p[1])
+    data_obj = Data(edge_index=edge_index, num_nodes=num_nodes)
+    text_nodes_all = sorted([(txt, gid) for gid, txt in node_texts.items() if gid not in processed_ids],
+                            key=lambda p: p[1])
 
-    #Optional: further limit the number of text nodes embedded
-    # if USE_SUBSET and SUBSET_SIZE_GRAPH_EMBED_NODES and SUBSET_SIZE_GRAPH_EMBED_NODES > 0:
-    #     text_nodes_all = text_nodes_all[:SUBSET_SIZE_GRAPH_EMBED_NODES]
-    #     print(f"⚠️ Limiting embedding stage to {len(text_nodes_all)} text nodes")
+    if not text_nodes_all:
+        print("✅ No new nodes to process in this chunk (all covered by his_embed or processed).")
+        x.flush()
+        json.dump(list(processed_ids), open(PROCESSED_IDS_PATH, "w"))
+        return
 
-    # Chunk slicing
     chunk_size = max(1, len(text_nodes_all) // max(1, num_chunks))
     start_i = chunk_index * chunk_size
     end_i = (chunk_index + 1) * chunk_size if (chunk_index < num_chunks - 1) else len(text_nodes_all)
-    text_nodes = [tn for tn in text_nodes_all[start_i:end_i] if tn[1] not in processed_ids]
+    target_text_nodes = [tn for tn in text_nodes_all[start_i:end_i]]
 
-    batch_size = 256 if device.type != 'cuda' else 2048
-    save_every = 50 if device.type != 'cuda' else 200
+    loader = NeighborLoader(
+        data_obj,
+        input_nodes=torch.tensor([gid for _, gid in target_text_nodes], dtype=torch.long),
+        num_neighbors=[0],
+        batch_size=2048 if device.type == 'cuda' else 256,
+        shuffle=False
+    )
 
-    print(f"📦 Embedding chunk {chunk_index+1}/{num_chunks}: {len(text_nodes)} nodes, batch size {batch_size}")
+    save_every = 10 if device.type != 'cuda' else 50
+    total_processed = 0
 
-    for batch_num, i in enumerate(tqdm(range(0, len(text_nodes), batch_size), desc="Embedding", unit="batch")):
-        batch_segment = text_nodes[i:i+batch_size]
-        inputs = tokenizer([node[0] for node in batch_segment],
-                           return_tensors="pt", padding=True, truncation=True, max_length=64).to(device)
+    for batch_num, batch in enumerate(tqdm(loader, desc="Embedding text nodes", unit="batch")):
+        texts = [node_texts[n.item()] for n in batch.n_id if n.item() in node_texts and n.item() not in processed_ids]
+        if not texts:
+            continue
+
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=64).to(device)
         with torch.no_grad():
             out = model(**inputs)
             pooled = _mean_pool(out.last_hidden_state, inputs["attention_mask"])
             embeddings = torch.nn.functional.normalize(pooled, p=2, dim=1).cpu().numpy().astype(np.float16)
 
-        for j, idx in enumerate([node[1] for node in batch_segment]):
-            x[idx] = embeddings[j]
-            processed_ids.add(idx)
+        idxs = [n.item() for n in batch.n_id if n.item() in node_texts and n.item() not in processed_ids]
+        for j, node_id in enumerate(idxs):
+            x[node_id] = embeddings[j]
+            processed_ids.add(node_id)
+            total_processed += 1
 
-        if ((batch_num + 1) % save_every == 0) or (i + batch_size >= len(text_nodes)):
+        if (batch_num + 1) % save_every == 0:
             x.flush()
             json.dump(list(processed_ids), open(PROCESSED_IDS_PATH, "w"))
 
-    print(f"✅ Done embedding chunk in {time.time()-start_time_all:.2f}s, total processed {len(processed_ids)}")
     x.flush()
     json.dump(list(processed_ids), open(PROCESSED_IDS_PATH, "w"))
+    print(f"✅ Done embedding chunk in {time.time() - start_time_all:.2f}s, total processed={total_processed + assign_count}")
 
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     gc.collect()
-
 def merge_chunks_to_full():
-    print("🔄 Merging partial embeddings...")
-    x_partial = np.memmap(PARTIAL_X_PATH, dtype=np.float16, mode='r', shape=(num_nodes, EMB_DIM))
-    x_final   = np.memmap(X_SAVE_PATH, dtype=np.float16, mode='w+', shape=(num_nodes, EMB_DIM))
-    for i in tqdm(range(num_nodes), desc="Merging", unit="row"):
-        x_final[i] = x_partial[i]
+    """Merge partial embedding memmap into the final X_SAVE_PATH file.
+       Also fills any missing Review node embeddings from precomputed his_embed."""
+    if not os.path.exists(PARTIAL_X_PATH):
+        raise FileNotFoundError(f"❌ Partial embedding file not found: {PARTIAL_X_PATH}")
+
+    # Map the partial file in read mode
+    try:
+        x_partial = np.memmap(PARTIAL_X_PATH, dtype=np.float16, mode='r', shape=(num_nodes, EMB_DIM))
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to open partial memmap: {e}")
+
+    if x_partial.shape != (num_nodes, EMB_DIM):
+        raise ValueError(f"❌ Shape mismatch: expected {(num_nodes, EMB_DIM)}, got {x_partial.shape}")
+
+    # --- 🔍 Fill in any missing review node vectors from his_embed ---
+    his_embed_path = "../bge_emb/task_3_dev_bge.emb"
+    if os.path.exists(his_embed_path):
+        his_embed_table = torch.load(his_embed_path, map_location="cpu").numpy()
+        zero_rows = 0
+        for his_id_str, node_id in his_to_graph.items():
+            if np.allclose(x_partial[node_id], 0, atol=1e-8):
+                his_id = int(his_id_str)
+                if his_id < his_embed_table.shape[0]:
+                    x_partial[node_id] = his_embed_table[his_id].astype(np.float16)
+                    zero_rows += 1
+        if zero_rows > 0:
+            print(f"🛠 Filled {zero_rows} missing Review node vectors from his_embed in merge step")
+    else:
+        print(f"⚠️ his_embed_path '{his_embed_path}' not found — cannot backfill missing Review nodes at merge.")
+
+    print(f"🔄 Merging partial embeddings ({x_partial.shape[0]} nodes, dim={x_partial.shape[1]}) → {X_SAVE_PATH}")
+
+    # Allocate the final memmap and copy in one vectorised operation
+    x_final = np.memmap(X_SAVE_PATH, dtype=np.float16, mode='w+', shape=(num_nodes, EMB_DIM))
+    x_final[:] = x_partial[:]
     x_final.flush()
-    print(f"✅ Merged to {X_SAVE_PATH}")
+
+    print(f"✅ Merged to {X_SAVE_PATH} (dtype={x_final.dtype}, size={x_final.nbytes/1e6:.2f} MB)")
+
+    # Clean up partial
     try:
         os.remove(PARTIAL_X_PATH)
-        print(f"🗑️ Deleted partial file: {PARTIAL_X_PATH}")
+        if os.path.exists(PROCESSED_IDS_PATH):
+            os.remove(PROCESSED_IDS_PATH)
+        print(f"🗑️ Deleted partial file(s): {PARTIAL_X_PATH} and processed IDs list")
     except OSError as e:
         print(f"⚠️ Could not delete partial file {PARTIAL_X_PATH}: {e}")
-
 # -----------------------------
 # TRAIN
 # -----------------------------
