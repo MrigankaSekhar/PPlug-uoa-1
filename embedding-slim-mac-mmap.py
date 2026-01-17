@@ -2,6 +2,7 @@ import argparse, os, torch, numpy as np
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
 import ijson
+import json
 
 USE_SUBSET = True  # change to False to use full dataset
 idx = 3  # LaMP_time_3
@@ -16,30 +17,41 @@ parser.add_argument("--max-length", type=int, default=128)
 parser.add_argument("--merge-only", action="store_true", help="Only merge chunk files into final .bge.npy")
 args = parser.parse_args()
 
-# Merge step
+# -----------------------------------------
+# Merge step for per-split chunks
+# -----------------------------------------
 def merge_chunks():
     print("🔄 Merging chunk files into final bge npy...")
     for split in ["train", "dev"]:
         merged = []
-        for chunk_idx in range(args.num_chunks):  # ✅ fixed variable name
-            chunk_path = f"./bge_emb/task_3_{split}_chunk{chunk_idx}.npy"
+        chunk_files = []
+        for chunk_idx in range(args.num_chunks):
+            chunk_path = f"./bge_emb/task_{idx}_{split}_chunk{chunk_idx}.npy"
             if not os.path.exists(chunk_path):
                 raise FileNotFoundError(f"Missing chunk file: {chunk_path}")
             merged.append(np.load(chunk_path))
+            chunk_files.append(chunk_path)
         final_arr = np.vstack(merged)
-        final_path = f"./bge_emb/task_3_{split}_bge.npy"
+        final_path = f"./bge_emb/task_{idx}_{split}_bge.npy"
         np.save(final_path, final_arr)
         print(f"✅ Final merged file saved: {final_path} ({final_arr.shape[0]} rows)")
+        # Clean up chunk files after merge
+        for chunk_path in chunk_files:
+            try:
+                os.remove(chunk_path)
+                print(f"🗑️ Deleted chunk file: {chunk_path}")
+            except Exception as e:
+                print(f"⚠️ Could not delete chunk file {chunk_path}: {e}")
     print("🎯 Merge complete.")
 
 if args.merge_only:
     merge_chunks()
     exit(0)
 
-# Device choice
+# -----------------------------------------
+# Device setup
+# -----------------------------------------
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-# Force float32 on MPS to avoid mixed-type kernel crashes
 dtype = torch.float32 if device.type == "mps" else torch.float16
 print(f"✅ Using {device}, dtype={dtype}")
 
@@ -48,7 +60,7 @@ tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 model = AutoModel.from_pretrained(args.model_path, torch_dtype=dtype).to(device).eval()
 MODEL_DIM = getattr(model.config, "hidden_size", 768)
 
-# Skip torch.compile for MPS
+# Disable torch.compile for MPS
 try:
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
@@ -60,6 +72,9 @@ try:
 except Exception:
     print("ℹ️ torch.compile failed, running eagerly")
 
+# -----------------------------------------
+# Helper functions
+# -----------------------------------------
 def mean_pool(last_hidden_state, attention_mask):
     mask = attention_mask.unsqueeze(-1).type_as(last_hidden_state)
     summed = (last_hidden_state * mask).sum(dim=1)
@@ -74,24 +89,43 @@ def stream_dataset(json_path):
 def entry_texts(entry):
     return [his["text"] for his in entry.get("profile", [])] + [entry.get("input", "")]
 
-# Dataset path
+# -----------------------------------------
+# Dataset root folder
+# -----------------------------------------
 if USE_SUBSET:
     dir_name = f"LaMP_time_{idx}_subset"
 else:
     dir_name = f"LaMP_time_{idx}"
 print(f"[embedding] Using dataset path: {dir_name}")
 
-# Ensure output directory exists
 os.makedirs("./bge_emb", exist_ok=True)
 
-# Save chunk files first
+# -----------------------------------------
+# Embedding generation loop
+# -----------------------------------------
 for split in ["train", "dev"]:
     json_path = os.path.join(dir_name, f"{split}_questions.json")
 
-    # Collect all texts
     all_texts = []
+    all_his_ids = []
+
     for entry in stream_dataset(json_path):
-        all_texts.extend(entry_texts(entry))
+        for his in entry.get("profile", []):
+            # Use REAL review IDs if available, fall back to synthetic ones
+            real_id = str(his.get("id")) if "id" in his else str(len(all_his_ids))
+            all_texts.append(his["text"])
+            all_his_ids.append(real_id)
+
+        # Optionally add the main input text as well
+        all_texts.append(entry.get("input", ""))
+        all_his_ids.append(None)  # we don't embed the query itself
+
+    # Save mapping for profile reviews only
+    his_id_to_row = {hid: idx for idx, hid in enumerate(all_his_ids) if hid is not None}
+    map_path = f"./bge_emb/task_{idx}_{split}_bge_idmap.json"
+    with open(map_path, "w") as f:
+        json.dump(his_id_to_row, f)
+    print(f"✅ Saved his_id to row mapping: {map_path}")
 
     total_rows = len(all_texts)
     chunk_size = (total_rows + args.num_chunks - 1) // args.num_chunks
@@ -103,14 +137,12 @@ for split in ["train", "dev"]:
 
     embeddings = np.zeros((len(texts_chunk), MODEL_DIM), dtype=np.float16)
 
-    for i in tqdm(range(0, len(texts_chunk), args.batch_size), desc="Embedding", unit="batch"):
+    for i in tqdm(range(0, len(texts_chunk), args.batch_size), desc=f"Embedding({split})", unit="batch"):
         batch_texts = texts_chunk[i:i+args.batch_size]
-        # ✅ Clamp max_length safely to avoid token overflow warnings
-        safe_max_len = min(args.max_length, tokenizer.model_max_length)       
+        safe_max_len = min(args.max_length, tokenizer.model_max_length)
         enc = tokenizer(batch_texts, padding=True, truncation=True,
                         max_length=safe_max_len, return_tensors="pt")
-        
-        # Keep integer types for ids, mask, and token type ids
+
         for k, v in enc.items():
             if k in ("input_ids", "attention_mask", "token_type_ids"):
                 enc[k] = v.to(device)
@@ -128,9 +160,30 @@ for split in ["train", "dev"]:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    chunk_file = f"./bge_emb/task_3_{split}_chunk{args.chunk_index}.npy"
+    chunk_file = f"./bge_emb/task_{idx}_{split}_chunk{args.chunk_index}.npy"
     np.save(chunk_file, embeddings)
     print(f"✅ Saved {len(texts_chunk)} rows to {chunk_file}")
 
-# Merge after saving
+# -----------------------------------------
+# Merge per-split chunk files
+# -----------------------------------------
 merge_chunks()
+
+# -----------------------------------------
+# ✅ Finalization step (separate train/dev outputs)
+# -----------------------------------------
+def finalize_train_dev():
+    """
+    Finalize train/dev embeddings independently.
+    Keeps separate .npy and idmap.json files ready for ModelForPer_slim_GNN.
+    """
+    print("\n🎯 Finalization complete — separate train/dev files kept.")
+    print("✅ Files ready for model usage:")
+    print(f"  ./bge_emb/task_{idx}_train_bge.npy")
+    print(f"  ./bge_emb/task_{idx}_dev_bge.npy")
+    print(f"  ./bge_emb/task_{idx}_train_bge_idmap.json")
+    print(f"  ./bge_emb/task_{idx}_dev_bge_idmap.json")
+    print("----------------------------------------------------------")
+
+if __name__ == "__main__":
+    finalize_train_dev()

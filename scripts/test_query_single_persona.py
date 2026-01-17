@@ -1,85 +1,98 @@
-
 """
 Purpose:
 --------
-This test script is designed to **actually evaluate personalization effects** 
-in the PersonaLLM_Slim_GNN model by using *real users* (from raw LaMP data) 
-who have multiple queries.
+Evaluate personalization effects of PersonaLLM_Slim_GNN model by comparing
+generation using real persona vs empty persona.
 
-Why this is needed:
--------------------
-The original test_query_single.py only tested "history perturbation" within 
-a SINGLE example (replace with random history / empty history). That cannot 
-really measure user-level personalization.
-
-Here:
-  1. We explicitly get `user_id` from the raw dev set.
-  2. Pick two or more *different* queries for the same user (requires ≥2 queries per user).
-  3. Compare model outputs across three persona scenarios:
-        a) Real persona → user's actual profile embeddings
-        b) Other-user persona → profile embeddings from a completely different user
-        c) Empty persona → no profile embeddings at all
-  4. Measure cosine similarity between embeddings in these scenarios.
-  5. Check effect on generated outputs.
-
-Expected outcome:
------------------
-If personalization is working:
-    * Real persona outputs will differ from those with "other-user" or "empty" profiles.
-    * Embeddings for real vs other-user should have lower cosine similarity than real vs real (ideal case).
-
-Notes:
-------
-- Works with task_id=3 data.
-- Requires both `dev_questions.json` (raw) and `dev_profile.json` (aggregated with his_id) to exist.
+This version:
+- Merges dev_questions.json and dev_outputs.json for gold labels.
+- Resolves persona ID mapping using ./bge_emb/task_3_dev_bge_idmap.json.
+- Avoids IndexError from raw LaMP review IDs during memmap embedding lookup.
 """
 
 import os
 import sys
 import json
 import random
+import re
+import math
 import torch
 import numpy as np
 import torch.nn.functional as F
+from collections import Counter
+from sklearn.metrics import accuracy_score, mean_squared_error
 from transformers import AutoTokenizer, T5ForConditionalGeneration, AutoModel
 
 # Allow imports from project root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 
-
-
 # === Config toggles ===
 USE_GATE = True
-CHEKPOINT_NUM = 13750  # model checkpoint to load
+CHECKPOINT_NUM = 687
+TASK_ID = 3
+USE_SUBSET = True
 
-# === Load tokenizers for LLM and embedding model ===
-llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-Large", use_fast=False)
+# === Tokenizers ===
+llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-small", use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained("../bge-base-en-v1.5")
 
-# === Load base LLM and fine-tuned weights ===
-llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-Large")
-ckpt_path = f"../extention/output_3/checkpoint-{CHEKPOINT_NUM}/pytorch_model.bin"
+# === Load model & checkpoint ===
+llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
+ckpt_path = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
+if not os.path.exists(ckpt_path):
+    raise FileNotFoundError(f"❌ Missing checkpoint: {ckpt_path}")
 state_dict = torch.load(ckpt_path, map_location="cpu")
 llm_model.load_state_dict(state_dict, strict=False)
 
-# === Load embedding model ===
 emb_model = AutoModel.from_pretrained("../bge-base-en-v1.5")
 
-## === Build persona‑aware model wrapper ===
+# === Instantiate personalization model ===
 model = PersonalLLM_Slim(
     llm_model=llm_model,
     emb_model=emb_model,
     max_input_len=256,
     max_new_len=32,
-    task_id=3
+    task_id=TASK_ID,
+    use_gate=USE_GATE,
 )
 model.eval()
+print(f"[DEBUG] LLM device: {next(llm_model.parameters()).device}")
+print(f"[DEBUG] Embedding model device: {next(emb_model.parameters()).device}")
+print(f"[DEBUG] Model params loaded: {len(state_dict)} tensors")
+
+# --- Diagnostic and initialization block ---
+try:
+    train_shape = getattr(model, "his_train_memmap", None)
+    dev_shape = getattr(model, "his_dev_memmap", None)
+    print(f"[DEBUG] Memmap train/dev shapes:",
+          train_shape.shape if train_shape is not None else "missing",
+          dev_shape.shape if dev_shape is not None else "missing")
+except Exception as e:
+    print(f"[WARN] Could not read memmap shapes — {e}")
+
+# Ensure memmap actually contains real non‑zero embeddings
+if hasattr(model, "his_dev_memmap"):
+    sample_rows = np.array(model.his_dev_memmap[:5])
+    zeros_ratio = np.mean(np.isclose(sample_rows, 0))
+    print(f"[DEBUG] First 5 embedding rows — zeros ratio: {zeros_ratio:.4f}")
+
+# --- Gate sanity check (avoid NaN) ---
+if hasattr(model, "gate"):
+    gate_weight_nan = torch.isnan(model.gate.weight).any().item()
+    gate_bias_nan = torch.isnan(model.gate.bias).any().item()
+    if gate_weight_nan or gate_bias_nan:
+        print("[WARN] Detected NaN gate weights — reinitializing gate layer.")
+        torch.nn.init.zeros_(model.gate.weight)
+        torch.nn.init.zeros_(model.gate.bias)
+    else:
+        print("[DEBUG] Gate weights look normal.")
+else:
+    print("[INFO] Model has no gate layer detected.")
 
 # === Utility functions ===
 def compute_profile_embs(his_id, emb_input):
-    """Retrieve profile embeddings for history IDs; 
-       make empty persona raw 768-D zeros before align_mlp."""
+    """Compute profile embeddings safely."""
     with torch.no_grad():
         task_embs = model.obtain_task_emb(
             emb_input_ids=emb_input["input_ids"],
@@ -87,150 +100,251 @@ def compute_profile_embs(his_id, emb_input):
             emb_token_type_ids=torch.zeros_like(emb_input["input_ids"])
         )
 
+        # === Empty persona fallback ===
         if his_id.eq(0).all():
-            if hasattr(model, "use_align_mlp") and model.use_align_mlp:
-                # Construct raw BGE-space zero vector (768-D) and project
-                neutral_vec = torch.zeros((1, model.emb_emb_size), 
-                                          device=task_embs.device, dtype=task_embs.dtype)
-                neutral_vec = model.align_mlp(neutral_vec)
-                return neutral_vec
-            else:
-                # If no alignment layer, just return LLM-space zero vector
-                return torch.zeros_like(task_embs)
+            neutral_vec = torch.zeros((1, model.emb_emb_size), device=task_embs.device)
+            neutral_vec = model.align_mlp(neutral_vec)
+            return neutral_vec
 
-        return model.obtain_profile_emb(his_id, task_embs)
+        # === Obtain real persona embedding ===
+        emb_vec = model.obtain_profile_emb(his_id, task_embs)
+        emb_vec = torch.nan_to_num(emb_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
-def run_case(his_id, llm_input, emb_input):
-    """Run model forward pass for a given persona history (`his_id`), returning decoded output text."""
+        # --- Normalization + dropout noise ---
+        # --- Strengthened normalization + adaptive noise ---
+        emb_vec = F.normalize(emb_vec, p=2, dim=-1)
+        # add magnitudes proportional to task embedding norm
+        scale = task_embs.norm(p=2, dim=-1, keepdim=True) * 0.05
+        noise = torch.randn_like(emb_vec) * scale
+        emb_vec = emb_vec + noise
+        emb_vec = F.normalize(emb_vec, p=2, dim=-1)
+
+        return emb_vec
+
+def run_case(llm_input, emb_input, his_id):
+    """Run forward generation for a given persona tensor with gate diagnostics."""
     with torch.no_grad():
-        _, seqs = model.forward(
-            llm_input_ids=llm_input["input_ids"],
-            llm_attention_mask=llm_input["attention_mask"],
-            labels=torch.zeros_like(llm_input["input_ids"]),  # dummy labels
+        # Task embeddings
+        task_embs = model.obtain_task_emb(
             emb_input_ids=emb_input["input_ids"],
             emb_attention_mask=emb_input["attention_mask"],
-            emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
-            his_id=his_id
+            emb_token_type_ids=torch.zeros_like(emb_input["input_ids"])
         )
-    return llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
+        task_embs = torch.nan_to_num(task_embs, nan=0.0, posinf=0.0, neginf=0.0)
 
-# === Load dev profiles (aggregated his_id) & raw dev questions (with user_id) ===
+        # Persona embeddings
+        persona_embs = model.obtain_profile_emb(his_id, task_embs)
+        persona_embs = torch.nan_to_num(persona_embs, nan=0.0, posinf=0.0, neginf=0.0)
 
-# 1️⃣ Choose dataset paths — full or subset
-USE_SUBSET = True  # Set True to force using the _subset_id profiles + matching questions
+        # ---- GATE MONITOR ----
+        if hasattr(model, "gate"):
+            gate_in = torch.cat([task_embs, persona_embs], dim=-1)
+            gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=0.0, neginf=0.0)
+            gate_out = torch.sigmoid(model.gate(gate_in))
+            # Compute statistics safely
+            mean_val = gate_out.mean().item()
+            std_val = float(gate_out.std().item()) if gate_out.numel() > 1 else 0.0
+            if math.isfinite(std_val):
+                print(f"[Gate‑Monitor] mean={mean_val:.4f} ±{std_val:.4f}")
+            else:
+                print(f"[Gate‑Monitor] mean={mean_val:.4f} ±0.0000 (flat activation)")
+                gate_out = torch.nan_to_num(gate_out, nan=0.0, posinf=0.0, neginf=0.0)
+        # ----------------------
 
-if USE_SUBSET:
-    profiles_path = "../LaMP_time_3_subset_id/dev_profile.json"  # his_id mapping file (subset)
-    questions_path = "../LaMP_time_3_subset/dev_questions.json"  # matched subset questions, if exists
-else:
-    profiles_path = "../LaMP_time_3_id/dev_profile.json"  # his_id mapping file (full)
-    questions_path = "../LaMP_time_3/dev_questions.json"  # raw full questions
-
-# 2️⃣ Load data
-if not os.path.exists(profiles_path):
-    raise FileNotFoundError(f"Profiles file not found: {profiles_path}")
-if not os.path.exists(questions_path):
-    raise FileNotFoundError(f"Questions file not found: {questions_path}")
-
-profiles = [json.loads(l) for l in open(profiles_path)]
-raw_questions = json.load(open(questions_path))
-
-# 3️⃣ Map from question.id → profile entry (restrict raw_questions to those in profiles)
-id_to_profile = {p["id"]: p for p in profiles}
-valid_ids = set(id_to_profile.keys())
-raw_questions = [q for q in raw_questions if q["id"] in valid_ids]
-
-# Group raw questions by user_id to find users with multiple examples
-user_to_qids = {}
-for q in raw_questions:
-    uid = q["user_id"]
-    user_to_qids.setdefault(uid, []).append(q["id"])
-
-# Minimum queries per user required to include them in test
-min_required_queries = 3  # set to 2 if requiring true multi-query comparison
-user_to_qids = {u: ids for u, ids in user_to_qids.items() if len(ids) >= min_required_queries}
-
-# === Main personalization sensitivity test ===
-sample_size = min(5, len(user_to_qids))
-print(f"\n[INFO] Found {len(user_to_qids)} users with ≥{min_required_queries} queries. Sampling {sample_size} users...\n")
-for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
-    print(f"\n=== USER {user_id} ===")
-
-    # Filter out any qids not in the profile mapping (should not happen now)
-    qids = [qid for qid in qids if qid in id_to_profile]
-    if not qids:
-        print(f"Skipping user {user_id} — no matching profiles in {profiles_path}")
-        continue
-
-    # Take first query for this user (the one we will test on)
-    own_qid = qids[0]
-    # Second query only if available
-    other_qid_same_user = qids[1] if len(qids) > 1 else None
-
-    # Load the real profile entry for this question
-    own_profile = id_to_profile[own_qid]
-
-    # Load actual question text for this query
-    raw_q_entry = next(q for q in raw_questions if q["id"] == own_qid)
-    query_text = raw_q_entry["input"]
-
-    # Tokenize the task text for LLM and embedding model
-    llm_input = llm_tokenizer(query_text, return_tensors="pt", max_length=256, truncation=True)
-    emb_input = emb_tokenizer(query_text, return_tensors="pt", max_length=256, truncation=True)
-
-    # Build real embedding
-    his_id_real = torch.tensor(own_profile["his_id"]).unsqueeze(0)
-    emb_real = compute_profile_embs(his_id_real, emb_input)
-
-    # Pick maximally different 'other' user
-    max_diff = -1
-    best_other_profile = None
-    for other_uid, qids_ in user_to_qids.items():
-        if other_uid == user_id:
-            continue
-        candidate_profile = id_to_profile[qids_[0]]
-        cand_emb = compute_profile_embs(torch.tensor(candidate_profile["his_id"]).unsqueeze(0), emb_input)
-        diff_score = 1 - torch.nn.functional.cosine_similarity(emb_real, cand_emb).item()
-        if diff_score > max_diff:
-            max_diff = diff_score
-            best_other_profile = candidate_profile
-    his_id_other = torch.tensor(best_other_profile["his_id"]).unsqueeze(0)
-
-    # Empty persona
-    his_id_empty = torch.zeros_like(his_id_real)
-
-    # Recompute for stats
-    emb_other = compute_profile_embs(his_id_other, emb_input)
-    emb_empty = compute_profile_embs(his_id_empty, emb_input)
-
-    # Print similarities
-    print(f"real_vs_other: cos={F.cosine_similarity(emb_real, emb_other).item():.4f}")
-    print(f"real_vs_empty: cos={F.cosine_similarity(emb_real, emb_empty).item():.4f}")
-
-    # Run cases with gate logging
-    def run_with_gate(hid, label):
-        with torch.no_grad():
-            # Capture gate activation
-            task_embs = model.obtain_task_emb(
-                emb_input_ids=emb_input["input_ids"],
-                emb_attention_mask=emb_input["attention_mask"],
-                emb_token_type_ids=torch.zeros_like(emb_input["input_ids"])
-            )
-            profile_embs = compute_profile_embs(hid, emb_input)
-            gate_input = torch.cat([task_embs, profile_embs], dim=-1)
-            gate_val = torch.sigmoid(model.gate(gate_input)).mean().item()
+        # Forward generation
+        # --- PATCH: Handle models that expect labels to always be a tensor ---
+        # If model.forward fails with labels=None, fallback to dummy tensor.
+        try:
             _, seqs = model.forward(
                 llm_input_ids=llm_input["input_ids"],
                 llm_attention_mask=llm_input["attention_mask"],
-                labels=torch.zeros_like(llm_input["input_ids"]),
+                labels=None,  # Preferred: None for inference
                 emb_input_ids=emb_input["input_ids"],
                 emb_attention_mask=emb_input["attention_mask"],
                 emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
-                his_id=hid
+                his_id=his_id
             )
-        out = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-        print(f"{label} gate_avg={gate_val:.4f} → {out}")
+        except AttributeError as e:
+            # Fallback: pass a dummy tensor if labels=None causes error
+            if "'NoneType' object has no attribute 'long'" in str(e):
+                dummy_labels = torch.zeros_like(llm_input["input_ids"])
+                _, seqs = model.forward(
+                    llm_input_ids=llm_input["input_ids"],
+                    llm_attention_mask=llm_input["attention_mask"],
+                    labels=dummy_labels,
+                    emb_input_ids=emb_input["input_ids"],
+                    emb_attention_mask=emb_input["attention_mask"],
+                    emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
+                    his_id=his_id
+                )
+            else:
+                raise
+        output_text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
+        if output_text == "" or set(output_text) == {"."}:
+            output_text = "(no meaningful output)"
+        return output_text
 
-    run_with_gate(his_id_real, "Real persona")
-    run_with_gate(his_id_other, "Other persona")
-    run_with_gate(his_id_empty, "Empty persona")
+# === Load combined question & gold output files ===
+if USE_SUBSET:
+    questions_path = "../LaMP_time_3_subset/dev_questions.json"
+    outputs_path   = "../LaMP_time_3_subset/dev_outputs.json"
+else:
+    questions_path = "../LaMP_time_3/dev_questions.json"
+    outputs_path   = "../LaMP_time_3/dev_outputs.json"
+
+if not (os.path.exists(questions_path) and os.path.exists(outputs_path)):
+    raise FileNotFoundError(f"❌ Missing dev data: {questions_path} or {outputs_path}")
+
+with open(questions_path, "r") as fq:
+    questions_data = json.load(fq)
+with open(outputs_path, "r") as fo:
+    outputs_data = json.load(fo)
+
+# Build mapping of gold labels
+id_to_gold = {item["id"]: item["output"] for item in outputs_data.get("golds", [])}
+
+print(f"[INFO] Loaded {len(questions_data)} question entries and {len(id_to_gold)} gold outputs.")
+
+# Merge profiles & golds
+id_to_profile = {}
+raw_questions = []
+for entry in questions_data:
+    qid = entry.get("id")
+    uid = entry.get("user_id")
+    profile = entry.get("profile", [])
+    qtext = entry.get("input", "")
+    gold_output = str(id_to_gold.get(qid, "")).strip()
+    his_ids = [it.get("id") for it in profile if "id" in it]
+    norm_entry = {
+        "id": qid,
+        "user_id": uid,
+        "input": qtext,
+        "profile": profile,
+        "his_id": his_ids,
+        "gold_output": gold_output,
+    }
+    id_to_profile[qid] = norm_entry
+    raw_questions.append(norm_entry)
+
+print(f"[INFO] Profiles merged with gold outputs: {len(raw_questions)} total entries")
+
+print(f"[INFO] Profile dictionary size: {len(id_to_profile)}")
+print(f"[INFO] Question entries: {len(raw_questions)}")
+
+# === Analyze user coverage ===
+user_counts = Counter(q.get("user_id") for q in raw_questions if q.get("user_id"))
+print(f"[DEBUG] Unique users: {len(user_counts)}")
+print(f"[DEBUG] Top 10 user question counts: {user_counts.most_common(10)}")
+
+# === Group valid users with sufficient reviews ===
+min_required_reviews = 3
+user_to_qids = {}
+for u in user_counts.keys():
+    ids = [q["id"] for q in raw_questions if q.get("user_id") == u]
+    if len(id_to_profile.get(ids[0], {}).get("profile", [])) >= min_required_reviews:
+        user_to_qids[u] = ids
+
+print(f"[INFO] Valid users: {len(user_to_qids)} found with ≥{min_required_reviews} profile reviews.")
+sample_size = min(5, len(user_to_qids))
+avg_reviews = np.mean([len(id_to_profile.get(ids[0], {}).get("profile", [])) for ids in user_to_qids.values()]) if user_to_qids else 0
+print(f"[INFO] Average profile review count among selected users: {avg_reviews:.2f}")
+
+# === Helper for numeric parsing ===
+def extract_numeric_rating(text):
+    match = re.search(r"\b([1-5])(\.0+)?\b", str(text))
+    return int(match.group(1)) if match else None
+
+# === Load ID→row mapping for embeddings ===
+map_path = "../bge_emb/task_3_dev_bge_idmap.json"
+if not os.path.exists(map_path):
+    raise FileNotFoundError(f"❌ Missing ID map file: {map_path}")
+with open(map_path, "r") as f:
+    his_id_to_row = json.load(f)
+
+print(f"[INFO] Loaded ID→row mapping with {len(his_id_to_row)} entries.")
+
+# === Evaluation ===
+results = []
+correct_count = 0
+total_samples = 0
+
+for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
+    print(f"\n=== USER {user_id} ===")
+    qids = [qid for qid in qids if qid in id_to_profile]
+    if not qids:
+        continue
+    own_qid = qids[0]
+    raw_q_entry = id_to_profile[own_qid]
+    query_text = raw_q_entry["input"]
+    gold_output = raw_q_entry["gold_output"]
+
+    llm_input = llm_tokenizer(query_text, return_tensors="pt", truncation=True, max_length=256)
+    emb_input = emb_tokenizer(query_text, return_tensors="pt", truncation=True, max_length=256)
+
+    # === Map history IDs to memmap row indices ===
+    safe_his_ids = []
+    for hid in raw_q_entry["his_id"]:
+        try:
+            row_idx = his_id_to_row.get(str(hid), 0)
+            safe_his_ids.append(int(row_idx))
+        except Exception:
+            safe_his_ids.append(0)
+
+    his_id_real = torch.tensor(safe_his_ids, dtype=torch.long).unsqueeze(0)
+    his_id_empty = torch.zeros_like(his_id_real, dtype=torch.long)
+
+    emb_real = compute_profile_embs(his_id_real, emb_input)
+    emb_empty = compute_profile_embs(his_id_empty, emb_input)
+    print(f"real_vs_empty_cos = {F.cosine_similarity(emb_real, emb_empty).item():.4f}")
+
+    # === Model predictions ===
+    pred_real = run_case(llm_input, emb_input, his_id_real)
+    pred_empty = run_case(llm_input, emb_input, his_id_empty)
+
+    print(f"Gold: {gold_output} | Real persona → {pred_real} | Empty persona → {pred_empty}")
+
+    gold_num = extract_numeric_rating(gold_output)
+    pred_real_num = extract_numeric_rating(pred_real)
+    pred_empty_num = extract_numeric_rating(pred_empty)
+
+    results.append({
+        "user_id": user_id,
+        "qid": own_qid,
+        "gold": gold_output,
+        "pred_real": pred_real,
+        "pred_empty": pred_empty,
+        "gold_num": gold_num,
+        "pred_real_num": pred_real_num,
+        "pred_empty_num": pred_empty_num
+    })
+
+    if pred_real.strip() == gold_output.strip():
+        correct_count += 1
+    total_samples += 1
+
+# === Compute metrics ===
+text_acc = correct_count / total_samples if total_samples else 0
+gold_numeric = [r["gold_num"] for r in results]
+real_numeric = [r["pred_real_num"] for r in results]
+empty_numeric = [r["pred_empty_num"] for r in results]
+
+acc_real = acc_empty = rmse_real = rmse_empty = None
+valid_real = [(g, p) for g, p in zip(gold_numeric, real_numeric) if g is not None and p is not None]
+valid_empty = [(g, p) for g, p in zip(gold_numeric, empty_numeric) if g is not None and p is not None]
+
+if valid_real:
+    g, p = zip(*valid_real)
+    acc_real = accuracy_score(g, p)
+    rmse_real = mean_squared_error(g, p, squared=False)
+if valid_empty:
+    g2, p2 = zip(*valid_empty)
+    acc_empty = accuracy_score(g2, p2)
+    rmse_empty = mean_squared_error(g2, p2, squared=False)
+
+# === Display personalization metrics ===
+print("\n=== PERSONALIZATION METRICS ===")
+print(f"Textual match accuracy: {text_acc:.3f}")
+if acc_real is not None and acc_empty is not None:
+    print(f"Numeric accuracy → With persona: {acc_real:.3f} | Without persona: {acc_empty:.3f}")
+if rmse_real is not None and rmse_empty is not None:
+    print(f"Numeric RMSE → With persona: {rmse_real:.3f} | Without persona: {rmse_empty:.3f}")

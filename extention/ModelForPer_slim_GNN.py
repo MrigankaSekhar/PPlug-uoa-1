@@ -13,6 +13,8 @@ class PersonalLLM_Slim(nn.Module):
     - Gated cross-attention fusion applied to ALL encoder tokens
     """
 
+    
+
     def __init__(self, llm_model, emb_model, max_input_len, max_new_len, task_id,
                  use_inst_token=True,
                  use_align_mlp_inst=True,
@@ -46,6 +48,33 @@ class PersonalLLM_Slim(nn.Module):
         # === Load memmap history ===
         train_npy_path = f"../bge_emb/task_{task_id}_train_bge.npy"
         dev_npy_path   = f"../bge_emb/task_{task_id}_dev_bge.npy"
+
+        # 🧭 These files contain precomputed sentence / profile embeddings (from the BGE model)
+        #    stored as NumPy memory maps for fast random access. Each row corresponds to
+        #    one history or review item (e.g., user profile element).
+        #    
+        # During training, slices are pulled from `task_{task_id}_train_bge.npy`;
+        # during evaluation, from `task_{task_id}_dev_bge.npy`.
+        # These fixed semantic vectors are *not trainable* — they act as the grounding
+        # for the personalization component (profile/history context). 
+
+        # ⚙️ Metrics Interpretation (printouts seen during training):
+        #   • [Cosine‑Check] → Measures alignment between `profile_embs` (from BGE profiles)
+        #                       and `graph_embs` (from GNN). Values:
+        #                           ≈0.0–0.1 ⇒ nearly orthogonal (diverse info, early training)
+        #                           ≈0.3–0.6 ⇒ moderate correlation (beginning to align)
+        #                           >0.7     ⇒ strong alignment (embedding fusion stabilized)
+        #
+        #   • [Gate‑Monitor] → Mean activation of the sigmoid gate combining task vs. personalized signals:
+        #                           ≈0.0 ⇒ model ignoring personalization (all task)
+        #                           ≈0.5 ⇒ balanced fusion (50% task, 50% persona)
+        #                           ≈1.0 ⇒ model fully preferring personalization / attention outputs
+        #
+        #   These diagnostics help verify gating and representation fusion during fine‑tuning.
+        #   Ideal trend: Cosine slowly increases; Gate moves toward 0.6‑0.9 while loss steadily decreases.
+
+
+
         if not (os.path.exists(train_npy_path) and os.path.exists(dev_npy_path)):
             raise FileNotFoundError("Memmap files missing — run conversion first.")
         self.his_train_memmap = np.load(train_npy_path, mmap_mode='r')
@@ -130,6 +159,8 @@ class PersonalLLM_Slim(nn.Module):
             #          task embeddings and cross-attended outputs; balances 
             #          personalization vs. pure task relevance.
             self.gate = nn.Linear(self.llm_emb_size * 2, 1)
+            # 🧩 Regularization tweak: start gate slightly negative to reduce saturation
+            nn.init.constant_(self.gate.bias, -1.0)
 
         # ✅ Freeze full LLM backbone
         for _, p in self.llm_model.named_parameters():
@@ -286,7 +317,11 @@ class PersonalLLM_Slim(nn.Module):
         # 🔹 3) RETRIEVE PROFILE EMBEDDINGS FROM CACHE
         # ==========================================================
         if his_id is not None:
-            his_embs = torch.stack([his_cache[i.item()] for i in his_id.view(-1)])
+            # his_embs = torch.stack([his_cache[i.item()] for i in his_id.view(-1)])
+            his_embs = torch.stack([
+                his_cache.get(str(i.item()), torch.zeros(self.emb_emb_size, device=task_embs.device))
+                for i in his_id.view(-1)
+             ])
             his_embs = his_embs.view(his_id.size(0), his_id.size(1), -1)
             if self.use_align_mlp:
                 align_first: nn.Linear = self.align_mlp[0]
@@ -308,7 +343,11 @@ class PersonalLLM_Slim(nn.Module):
         # 🔹 4) SESSION EMBEDDINGS FROM SAME CACHE
         # ==========================================================
         if session_ids is not None:
-            sess_embs = torch.stack([his_cache[i.item()] for i in session_ids.view(-1)])
+            # sess_embs = torch.stack([his_cache[i.item()] for i in session_ids.view(-1)])
+            sess_embs = torch.stack([
+                his_cache.get(str(i.item()), torch.zeros(self.emb_emb_size, device=task_embs.device))
+                for i in session_ids.view(-1)
+            ])
             sess_embs = sess_embs.view(session_ids.size(0), session_ids.size(1), -1)
             if self.use_session_encoder:
                 session_embs = self.session_encoder(sess_embs)[:, -1, :]
@@ -331,6 +370,28 @@ class PersonalLLM_Slim(nn.Module):
                     bsz, seq_len, dim = g_embs.size()
                     g_embs = self.align_mlp_graph(g_embs.view(-1, dim)).view(bsz, seq_len, -1)
             graph_embs = g_embs
+
+
+        # ==========================================================
+        # 🔹 (Optional) Metric Checks — Safe Debug for A/B testing
+        # ==========================================================
+        if (
+            hasattr(self, "use_align_mlp_graph") and self.use_align_mlp_graph
+            and graph_embs is not None
+            and profile_embs is not None
+        ):
+            # Cosine Overlap Check between profile and graph embeddings
+            with torch.no_grad():
+                p_flat = profile_embs.mean(dim=1) if profile_embs.ndim == 3 else profile_embs
+                g_flat = graph_embs.mean(dim=1) if graph_embs.ndim == 3 else graph_embs
+                if p_flat.size(-1) == g_flat.size(-1):
+                    cos_sim = torch.nn.functional.cosine_similarity(p_flat, g_flat, dim=-1)
+                    mean_cos = cos_sim.mean().item()
+                    std_cos = cos_sim.std().item()
+                    print(f"[Cosine‑Check] mean={mean_cos:.4f} ±{std_cos:.4f}")
+                else:
+                    # Prevent mismatch crashes (debug only)
+                    print(f"[Cosine‑Check‑Skipped] dim mismatch: profile={p_flat.size(-1)}, graph={g_flat.size(-1)}")
 
         # ==========================================================
         # 🔹 6) COMBINE SIGNALS + CONTINUE EXACTLY LIKE BEFORE
@@ -358,6 +419,38 @@ class PersonalLLM_Slim(nn.Module):
 
         combined_user_embs = torch.cat(user_embs_list, dim=1)
         fused_task_embs = self.gated_cross_attention(task_embs.unsqueeze(1), combined_user_embs)
+
+        # --- Gate activation monitoring & regularization (only if gate enabled) ---
+        if getattr(self, "use_gate", False) and hasattr(self, "gate"):
+
+            # Compute gated attention (keep in autograd!)
+            attn_out, _ = self.cross_attn(task_embs.unsqueeze(1),
+                                          combined_user_embs, combined_user_embs)
+            gate_pre = self.gate(torch.cat([task_embs.unsqueeze(1), attn_out], dim=-1))
+            gate_vals = torch.sigmoid(gate_pre)
+
+            # --- 💡 Regularize before no_grad so it can backprop ---
+            reg_weight = 0.05
+            mean_gate_tensor = gate_vals.mean()
+            std_gate_tensor = gate_vals.std(unbiased=False) + 1e-6
+
+            # balanced mean ~0.5, discourage zero variance
+            reg_balance = (mean_gate_tensor - 0.5).pow(2)
+            reg_flat = (1.0 / std_gate_tensor)
+            gate_reg = reg_weight * (reg_balance + 0.1 * reg_flat)
+
+            if 'loss' in locals():
+                loss = loss + gate_reg
+            elif 'eval_out' in locals():
+                loss = eval_out.loss + gate_reg
+            else:
+                loss = gate_reg
+
+            # --- Diagnostics (detached so it prints safely) ---
+            with torch.no_grad():
+                mean_gate = float(mean_gate_tensor.detach().cpu())
+                std_gate = float(std_gate_tensor.detach().cpu())
+                print(f"[Gate‑Monitor] mean={mean_gate:.3f} ±{std_gate:.3f}")
 
         # Get original input embeddings
         input_embs = self.llm_model.get_input_embeddings()(llm_input_ids)

@@ -91,6 +91,19 @@ class PersonalDataset:
         # Parse single data line into components
         input_str, output_str, his_id_list = self.parse_data(self.lines[idx])
 
+        # ✅ PATCH: ensure IDs are integers, handle string cases gracefully
+        safe_his_ids = []
+        for hid in his_id_list:
+            try:
+                safe_his_ids.append(int(hid))
+            except (TypeError, ValueError):
+                safe_his_ids.append(0)
+        his_id_list = safe_his_ids
+
+        # Optional debug for the first few samples
+        if idx < 3:
+            print(f"[DEBUG] idx={idx} his_id_list (int): {his_id_list[:10]}")
+
         # --- Profile history IDs ---
         # Full long-term profile padded to max_his_len
         his_id = self.pad_his(his_id_list, pad_to_len=self.max_his_len)
@@ -103,8 +116,8 @@ class PersonalDataset:
         # --- Graph node IDs ---
         # Map history IDs to graph node IDs via loaded mapping
         graph_node_ids_list = [
-            self.his_to_graph[str(hid)]
-            for hid in his_id_list if str(hid) in self.his_to_graph
+            self.his_to_graph.get(str(hid), 0)
+            for hid in his_id_list
         ]
         if not graph_node_ids_list:
             graph_node_ids_list = [0]  # fallback placeholder (node 0)

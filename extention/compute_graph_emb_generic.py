@@ -317,3 +317,5 @@ if __name__ == "__main__":
     final_array = x.cpu().numpy().astype(np.float16)  # Half precision
     np.save(SAVE_PATH.replace(".emb", ".npy"), final_array)
     print(f"✅ Saved FP16 memory-mapped embeddings to {SAVE_PATH.replace('.emb', '.npy')}")
+    np.save(SAVE_PATH, final_array.astype(np.float16))
+    print(f"✅ Saved graph embeddings to {SAVE_PATH} as NumPy .npy format")
