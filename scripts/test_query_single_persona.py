@@ -34,16 +34,20 @@ TASK_ID = 3
 USE_SUBSET = True
 
 # === Tokenizers ===
-llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-small", use_fast=False)
+llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-base", use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained("../bge-base-en-v1.5")
 
 # === Load model & checkpoint ===
-llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
+# Load personalized model (with checkpoint)
+llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-base")
 ckpt_path = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
 if not os.path.exists(ckpt_path):
     raise FileNotFoundError(f"❌ Missing checkpoint: {ckpt_path}")
 state_dict = torch.load(ckpt_path, map_location="cpu")
 llm_model.load_state_dict(state_dict, strict=False)
+
+# Load plain baseline model (NO checkpoint)
+plain_llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-base")
 
 emb_model = AutoModel.from_pretrained("../bge-base-en-v1.5")
 
@@ -136,11 +140,31 @@ def run_case(llm_input, emb_input, his_id):
         persona_embs = model.obtain_profile_emb(his_id, task_embs)
         persona_embs = torch.nan_to_num(persona_embs, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # ---- GATE MONITOR (MATCHING FORWARD PASS) ----
+        if hasattr(model, "gate") and hasattr(model, "cross_attn"):
+            # Prepare for cross-attention: shape (batch, seq, dim)
+            task_embs_exp = task_embs.unsqueeze(1)  # (B, 1, D)
+            persona_embs_exp = persona_embs.unsqueeze(1)  # (B, 1, D)
+            # Use cross-attention as in model.forward
+            attn_out, _ = model.cross_attn(task_embs_exp, persona_embs_exp, persona_embs_exp)
+            gate_in = torch.cat([task_embs_exp, attn_out], dim=-1)
+            gate_out = torch.sigmoid(model.gate(gate_in))
+            mean_val = gate_out.mean().item()
+            std_val = float(gate_out.std().item()) if gate_out.numel() > 1 else 0.0
+            print(f"[Gate‑Monitor-FWD] mean={mean_val:.4f} ±{std_val:.4f}")
+        # ------------------------------------------------
+
         # ---- GATE MONITOR ----
         if hasattr(model, "gate"):
             gate_in = torch.cat([task_embs, persona_embs], dim=-1)
             gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=0.0, neginf=0.0)
             gate_out = torch.sigmoid(model.gate(gate_in))
+
+            # Guard against NaNs or empty tensors
+            if torch.isnan(gate_out).any():
+                print("[Gate‑Monitor] ⚠️ NaN detected in gate output — replacing with zeros.")
+                gate_out = torch.zeros_like(gate_out)
+            
             # Compute statistics safely
             mean_val = gate_out.mean().item()
             std_val = float(gate_out.std().item()) if gate_out.numel() > 1 else 0.0
@@ -278,6 +302,8 @@ for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
     query_text = raw_q_entry["input"]
     gold_output = raw_q_entry["gold_output"]
 
+    print(f"Question: {query_text}")
+
     llm_input = llm_tokenizer(query_text, return_tensors="pt", truncation=True, max_length=256)
     emb_input = emb_tokenizer(query_text, return_tensors="pt", truncation=True, max_length=256)
 
@@ -301,11 +327,26 @@ for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
     pred_real = run_case(llm_input, emb_input, his_id_real)
     pred_empty = run_case(llm_input, emb_input, his_id_empty)
 
-    print(f"Gold: {gold_output} | Real persona → {pred_real} | Empty persona → {pred_empty}")
+    # 🟩 NEW: Run plain T5 baseline (no personalization)
+    with torch.no_grad():
+        baseline_output_ids = plain_llm_model.generate(
+            input_ids=llm_input["input_ids"],
+            attention_mask=llm_input["attention_mask"],
+            max_new_tokens=32,
+            num_beams=4,
+            do_sample=False
+        )
+        pred_baseline = llm_tokenizer.decode(baseline_output_ids[0], skip_special_tokens=True).strip()
+        if pred_baseline == "" or set(pred_baseline) == {"."}:
+            pred_baseline = "(no meaningful output)"
 
+    print(f"Gold: {gold_output} | Real persona → {pred_real} | Empty persona → {pred_empty} | Plain T5 → {pred_baseline}")
+
+    # --- Update metrics ---
     gold_num = extract_numeric_rating(gold_output)
     pred_real_num = extract_numeric_rating(pred_real)
     pred_empty_num = extract_numeric_rating(pred_empty)
+    pred_baseline_num = extract_numeric_rating(pred_baseline)
 
     results.append({
         "user_id": user_id,
@@ -313,9 +354,11 @@ for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
         "gold": gold_output,
         "pred_real": pred_real,
         "pred_empty": pred_empty,
+        "pred_baseline": pred_baseline,   # 🟩 store baseline too
         "gold_num": gold_num,
         "pred_real_num": pred_real_num,
-        "pred_empty_num": pred_empty_num
+        "pred_empty_num": pred_empty_num,
+        "pred_baseline_num": pred_baseline_num
     })
 
     if pred_real.strip() == gold_output.strip():
