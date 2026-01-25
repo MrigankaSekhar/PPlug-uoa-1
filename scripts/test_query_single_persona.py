@@ -29,17 +29,17 @@ from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 
 # === Config toggles ===
 USE_GATE = True
-CHECKPOINT_NUM = 687
+CHECKPOINT_NUM = 2062
 TASK_ID = 3
 USE_SUBSET = True
 
 # === Tokenizers ===
-llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-base", use_fast=False)
+llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-small", use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained("../bge-base-en-v1.5")
 
 # === Load model & checkpoint ===
 # Load personalized model (with checkpoint)
-llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-base")
+llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
 ckpt_path = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
 if not os.path.exists(ckpt_path):
     raise FileNotFoundError(f"❌ Missing checkpoint: {ckpt_path}")
@@ -47,7 +47,7 @@ state_dict = torch.load(ckpt_path, map_location="cpu")
 llm_model.load_state_dict(state_dict, strict=False)
 
 # Load plain baseline model (NO checkpoint)
-plain_llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-base")
+plain_llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
 
 emb_model = AutoModel.from_pretrained("../bge-base-en-v1.5")
 
@@ -64,6 +64,11 @@ model.eval()
 print(f"[DEBUG] LLM device: {next(llm_model.parameters()).device}")
 print(f"[DEBUG] Embedding model device: {next(emb_model.parameters()).device}")
 print(f"[DEBUG] Model params loaded: {len(state_dict)} tensors")
+
+print("Gate weights:", model.gate.weight.data)
+print("Gate bias:", model.gate.bias.data)
+print("Any NaN in gate weights?", torch.isnan(model.gate.weight).any().item())
+print("Any NaN in gate bias?", torch.isnan(model.gate.bias).any().item())
 
 # --- Diagnostic and initialization block ---
 try:
@@ -120,8 +125,8 @@ def compute_profile_embs(his_id, emb_input):
         # add magnitudes proportional to task embedding norm
         scale = task_embs.norm(p=2, dim=-1, keepdim=True) * 0.05
         noise = torch.randn_like(emb_vec) * scale
-        emb_vec = emb_vec + noise
-        emb_vec = F.normalize(emb_vec, p=2, dim=-1)
+        # emb_vec = emb_vec + noise  # <-- comment this line for pure embeddings
+        # emb_vec = F.normalize(emb_vec, p=2, dim=-1)
 
         return emb_vec
 
@@ -157,6 +162,9 @@ def run_case(llm_input, emb_input, his_id):
         # ---- GATE MONITOR ----
         if hasattr(model, "gate"):
             gate_in = torch.cat([task_embs, persona_embs], dim=-1)
+            print("Gate input stats (mean, std, min, max):", 
+                  gate_in.mean().item(), gate_in.std().item(), gate_in.min().item(), gate_in.max().item())
+            print("Any NaN in gate input?", torch.isnan(gate_in).any().item())
             gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=0.0, neginf=0.0)
             gate_out = torch.sigmoid(model.gate(gate_in))
 
@@ -279,13 +287,20 @@ def extract_numeric_rating(text):
     return int(match.group(1)) if match else None
 
 # === Load ID→row mapping for embeddings ===
-map_path = "../bge_emb/task_3_dev_bge_idmap.json"
-if not os.path.exists(map_path):
-    raise FileNotFoundError(f"❌ Missing ID map file: {map_path}")
-with open(map_path, "r") as f:
-    his_id_to_row = json.load(f)
+offsets_path = "../bge_emb/task_3_dev_offsets.json"
+if not os.path.exists(offsets_path):
+    raise FileNotFoundError(f"❌ Missing offsets file: {offsets_path}")
+with open(offsets_path, "r") as f:
+    offsets_data = json.load(f)
 
-print(f"[INFO] Loaded ID→row mapping with {len(his_id_to_row)} entries.")
+# Build mapping from profile_id to row index using offsets file
+his_id_to_row = {}
+for entry in offsets_data["entries"]:
+    start = entry["start"]
+    for idx, pid in enumerate(entry["profile_id"]):
+        his_id_to_row[str(pid)] = start + idx
+
+print(f"[INFO] Loaded ID→row mapping from offsets file with {len(his_id_to_row)} entries.")
 
 # === Evaluation ===
 results = []
@@ -322,7 +337,9 @@ for user_id, qids in random.sample(list(user_to_qids.items()), sample_size):
     emb_real = compute_profile_embs(his_id_real, emb_input)
     emb_empty = compute_profile_embs(his_id_empty, emb_input)
     print(f"real_vs_empty_cos = {F.cosine_similarity(emb_real, emb_empty).item():.4f}")
-
+    print("Persona embedding stats (mean, std, min, max):", 
+          emb_real.mean().item(), emb_real.std().item(), emb_real.min().item(), emb_real.max().item())
+    print("Any NaN in persona embedding?", torch.isnan(emb_real).any().item())
     # === Model predictions ===
     pred_real = run_case(llm_input, emb_input, his_id_real)
     pred_empty = run_case(llm_input, emb_input, his_id_empty)
@@ -391,3 +408,15 @@ if acc_real is not None and acc_empty is not None:
     print(f"Numeric accuracy → With persona: {acc_real:.3f} | Without persona: {acc_empty:.3f}")
 if rmse_real is not None and rmse_empty is not None:
     print(f"Numeric RMSE → With persona: {rmse_real:.3f} | Without persona: {rmse_empty:.3f}")
+
+# --- Gate bias correction ---
+if hasattr(model, "gate"):
+    gate_bias_val = model.gate.bias.data.item()
+    if abs(gate_bias_val + 1.0) < 1e-4:  # If still at -1.0 after loading
+        print("[INFO] Gate bias is still -1.0 after checkpoint load. Resetting to 0.0 for inference.")
+        torch.nn.init.constant_(model.gate.bias, 0.0)
+    print("Gate bias after correction:", model.gate.bias.data.item())
+
+print("\n=== FINAL DIAGNOSTICS ===")
+if hasattr(model, "gate"):
+    print("Final gate bias:", model.gate.bias.data.item())

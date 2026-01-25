@@ -6,8 +6,8 @@ from collections import defaultdict, Counter
 
 BASE_DIR = ".."
 TASK_ID = 3
-SUBSET_SIZE_TRAIN = 500   # desired total samples
-SUBSET_SIZE_DEV = 200     # desired total samples
+SUBSET_SIZE_TRAIN = 1500   # desired total samples
+SUBSET_SIZE_DEV = 500     # desired total samples
 SEED = 42
 
 MAX_PROFILE_ITEMS = 9  # only keep first N history entries

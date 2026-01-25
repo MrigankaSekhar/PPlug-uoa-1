@@ -26,8 +26,8 @@ from nltk.sentiment import SentimentIntensityAnalyzer
 # CONFIG
 # -----------------------------
 USE_SUBSET = True
-GRAPHSAGE_EPOCHS = 25
-GRAPHSAGE_HIDDEN_DIM = 384
+GRAPHSAGE_EPOCHS = 50
+GRAPHSAGE_HIDDEN_DIM = 512
 TASK_ID = 3
 
 DEV_DATASET_FOLDER_SUBSET = f"LaMP_time_{TASK_ID}_subset"
@@ -220,6 +220,17 @@ def build_graph_and_cache():
         }, f)
     print(f"✅ Cached graph to {CACHE_PATH}")
 
+    # Save his_id to graph node id mapping
+    with open(os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph.json"), "w") as f:
+        json.dump({str(k): v for k, v in his_to_graph.items()}, f)
+
+    # Save his_id to row index mapping for embedding table
+    his_ids = [str(hid) for hid in his_to_graph.keys() if str(hid).isdigit()]
+    his_id_to_row = {hid: idx for idx, hid in enumerate(his_ids)}
+    with open(os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_id_to_row.json"), "w") as f:
+        json.dump(his_id_to_row, f)
+    print(f"✅ Saved his_id_to_row mapping to {GRAPH_DIR}/task_{TASK_ID}_his_id_to_row.json")
+
 def load_cached_graph():
     if not os.path.exists(CACHE_PATH):
         raise FileNotFoundError(f"❌ Cache not found: {CACHE_PATH}. Run with --stage build first.")
@@ -237,7 +248,7 @@ def _mean_pool(last_hidden_state, mask):
     denom = mask.sum(dim=1).clamp(min=1e-9)
     return summed / denom
 
-def embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, chunk_index, num_chunks):
+def embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, chunk_index, num_chunks, split="train"):
     start_time_all = time.time()
     PARTIAL_X_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x_partial.npy")
     PROCESSED_IDS_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_processed_ids.json")
@@ -251,56 +262,27 @@ def embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, ch
         x = np.memmap(PARTIAL_X_PATH, dtype=np.float16, mode='w+', shape=(num_nodes, EMB_DIM))
         processed_ids = set()
 
-    # Load precomputed BGE embeddings
-    train_path = "../bge_emb/task_3_train_bge.npy"
-    dev_path   = "../bge_emb/task_3_dev_bge.npy"
-    idmap_t = "../bge_emb/task_3_train_bge_idmap.json"
-    idmap_d = "../bge_emb/task_3_dev_bge_idmap.json"
-    his_id_to_row, embeds = {}, []
-    if os.path.exists(train_path):
-        embeds.append(np.load(train_path, mmap_mode="r"))
-        if os.path.exists(idmap_t):
-            his_id_to_row.update({str(k): int(v) for k,v in json.load(open(idmap_t)).items()})
-        print(f"📂 Loaded train {train_path}")
-    if os.path.exists(dev_path):
-        offset = sum(e.shape[0] for e in embeds)
-        embeds.append(np.load(dev_path, mmap_mode="r"))
-        if os.path.exists(idmap_d):
-            dev_map = {str(k): int(v)+offset for k,v in json.load(open(idmap_d)).items()}
-            his_id_to_row.update(dev_map)
-        print(f"📂 Loaded dev {dev_path}")
-    his_embed_table = np.concatenate(embeds, axis=0) if embeds else None
-    print(f"✅ Table shape: {None if his_embed_table is None else his_embed_table.shape}")
+    # --- Load offsets mapping ---
+    offsets_path = f"../bge_emb/task_3_{split}_offsets.json"
+    emb_path = f"../bge_emb/task_3_{split}_bge.memmap.npy"
 
-    import re
+    with open(offsets_path) as f:
+        offsets_data = json.load(f)
+    offsets_map = {}
+    for entry in offsets_data["entries"]:
+        for idx, pid in enumerate(entry.get("profile_id", [])):
+            offsets_map[str(pid)] = entry["start"] + idx
 
-    if his_embed_table is not None:
-        # --- Diagnostic: measure overlap before embedding ---
-        numeric_graph_ids = set()
-        for k in his_to_graph.keys():
-            matches = re.findall(r"\d+", k)
-            if matches:
-                numeric_graph_ids.update(matches)
-        embed_ids = set(his_id_to_row.keys())
-        overlap = numeric_graph_ids & embed_ids
-        print(f"🔍 Graph review IDs={len(numeric_graph_ids)}, Embed IDs={len(embed_ids)}, Overlap={len(overlap)} "
-            f"({100*len(overlap)/max(1,len(numeric_graph_ids)):.2f}%)")
-        # (insert immediately after the overlap print line)
-        sample_graph_ids = list(sorted(numeric_graph_ids))[:10]
-        sample_embed_ids = list(sorted(embed_ids))[:10]
-        print(f"🔎 Sample graph IDs: {sample_graph_ids}")
-        print(f"🔎 Sample embed IDs: {sample_embed_ids}")
+    emb_table = np.memmap(emb_path, dtype=np.float32, mode="r", shape=(offsets_data["total_vectors"], offsets_data["dim"]))
 
-        assigned = 0
-        for k, nid in his_to_graph.items():
-            matches = re.findall(r"\d+", k)
-            key_stripped = matches[0] if matches else k
-            cand = his_id_to_row.get(key_stripped)
-            if cand is not None and cand < his_embed_table.shape[0]:
-                x[nid] = his_embed_table[cand].astype(np.float16)
-                processed_ids.add(nid)
-                assigned += 1
-        print(f"✅ Assigned {assigned} precomputed embeddings")
+    assigned = 0
+    for k, nid in his_to_graph.items():
+        row_idx = offsets_map.get(str(k))
+        if row_idx is not None and row_idx < emb_table.shape[0]:
+            x[nid] = emb_table[row_idx].astype(np.float16)
+            processed_ids.add(nid)
+            assigned += 1
+    print(f"✅ Assigned {assigned} precomputed embeddings using offsets_map for split '{split}'")
 
     tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_PATH)
     model = AutoModel.from_pretrained(BGE_MODEL_PATH).to(device).eval()
@@ -359,7 +341,8 @@ def train_gnn(edge_index, edge_weight, num_nodes):
         def __init__(self):
             super().__init__()
             self.c1 = SAGEConv(EMB_DIM, GRAPHSAGE_HIDDEN_DIM)
-            self.c2 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, EMB_DIM)
+            self.c2 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, GRAPHSAGE_HIDDEN_DIM)
+            self.c3 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, EMB_DIM)
             self.drop = nn.Dropout(0.4)
 
         def forward(self, x, edge_index, w=None):
@@ -369,9 +352,14 @@ def train_gnn(edge_index, edge_weight, num_nodes):
                 h = self.c1(x, edge_index).relu()
             h = self.drop(h)
             try:
-                h = self.c2(h, edge_index, edge_weight=w)
+                h = self.c2(h, edge_index, edge_weight=w).relu()
             except TypeError:
-                h = self.c2(h, edge_index)
+                h = self.c2(h, edge_index).relu()
+            h = self.drop(h)
+            try:
+                h = self.c3(h, edge_index, edge_weight=w)
+            except TypeError:
+                h = self.c3(h, edge_index)
             return torch.nn.functional.normalize(0.2 * h + 0.8 * x, p=2, dim=1)
 
     # Instantiate model and optimizer
@@ -390,7 +378,7 @@ def train_gnn(edge_index, edge_weight, num_nodes):
             cos_loss = 1 - torch.nn.functional.cosine_similarity(pred[mask], target[mask]).mean()
             src, dst = batch.edge_index
             nb_loss = 1 - torch.nn.functional.cosine_similarity(pred[src], pred[dst]).mean()
-            loss = 0.7 * cos_loss + 0.3 * nb_loss
+            loss = 0.5 * cos_loss + 0.5 * nb_loss
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -419,6 +407,9 @@ def compute_metrics_only(num_nodes):
     arr=np.load(SAVE_PATH,mmap_mode='r').astype(np.float32)
     zc=np.sum(np.linalg.norm(arr,axis=1)==0)
     print("Zero vectors:",zc)
+    zero_idxs = np.where(np.linalg.norm(arr, axis=1) == 0)[0]
+    print("Zero vector node indices:", zero_idxs)
+    # Optionally, print node types for these indices
     print("✅ Node count",num_nodes)
 
 
@@ -432,6 +423,7 @@ def compute_graph_metrics(edge_index, num_nodes):
     """
     import numpy as np
     from sklearn.metrics.pairwise import cosine_similarity
+    import networkx as nx
 
     X_SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x.npy")
     x = np.memmap(X_SAVE_PATH, dtype=np.float16, mode="r", shape=(num_nodes, EMB_DIM)).astype(np.float32)
@@ -457,6 +449,12 @@ def compute_graph_metrics(edge_index, num_nodes):
 
     diff = nb_sim.mean() - upper_tri.mean()
     print(f"🔍 Neighbor > Random similarity gap: {diff:.4f} (larger is better)\n")
+
+    # Degree statistics using networkx
+    G = nx.Graph()
+    G.add_edges_from(zip(src, dst))
+    degrees = [d for n, d in G.degree()]
+    print("Degree stats: min", min(degrees), "max", max(degrees), "mean", np.mean(degrees))
 # -----------------------------
 # CLI ENTRY
 # -----------------------------
@@ -466,6 +464,7 @@ if __name__ == "__main__":
                         choices=["build","embed","merge","train","infer","metrics"])
     parser.add_argument("--chunk-index", type=int, default=0)
     parser.add_argument("--num-chunks", type=int, default=1)
+    parser.add_argument("--split", type=str, default="train", choices=["train", "dev"])
     args = parser.parse_args()
 
     if args.stage == "build":
@@ -477,7 +476,7 @@ if __name__ == "__main__":
     )
 
     if args.stage == "embed":
-        embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, args.chunk_index, args.num_chunks)
+        embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, args.chunk_index, args.num_chunks, split=args.split)
     elif args.stage == "merge":
         merge_chunks_to_full(num_nodes)
     elif args.stage == "train":

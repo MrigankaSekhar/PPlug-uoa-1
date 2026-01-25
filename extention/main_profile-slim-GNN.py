@@ -28,7 +28,7 @@ class ConsoleMetricsCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None:
             return
-        keys_of_interest = ['loss', 'grad_norm', 'learning_rate', 'epoch']
+        keys_of_interest = ['loss', 'grad_norm', 'learning_rate', 'epoch', 'mae', 'rmse']
         selected = {k: logs[k] for k in keys_of_interest if k in logs}
         if selected:
             print(f"[METRICS] {json.dumps(selected)}")
@@ -104,16 +104,19 @@ def train_model(model_args, data_args, training_args):
 
     # Dataset building
     graph_emb_npy_path = f"../graph_emb/task_{int(training_args.output_dir.split('_')[-1])}_graph.npy"
+    his_to_graph_path = f"../graph_emb/task_{int(training_args.output_dir.split('_')[-1])}_his_to_graph.json"
 
     train_dataset = PersonalDataset(
         data_args.train_file, data_args.max_input_len, data_args.max_new_len,
         data_args.max_his_len, llm_tokenizer, emb_tokenizer,
-        graph_emb_path=graph_emb_npy_path
+        graph_emb_path=graph_emb_npy_path,
+        his_to_graph_path=his_to_graph_path
     )
     eval_dataset = PersonalDataset(
         data_args.dev_file, data_args.max_input_len, data_args.max_new_len,
         data_args.max_his_len, llm_tokenizer, emb_tokenizer,
-        graph_emb_path=graph_emb_npy_path
+        graph_emb_path=graph_emb_npy_path,
+        his_to_graph_path=his_to_graph_path
     )
 
     task_id = int(training_args.output_dir.split("_")[-1])

@@ -57,6 +57,22 @@ class PersonalDataset:
         """Number of records in the dataset."""
         return len(self.lines)
 
+    def normalize_his_id(self, hid):
+        key = str(hid)
+        # Direct match
+        if key in self.his_to_graph:
+            return key
+        # Try with "review_" prefix
+        review_key = f"review_{hid}"
+        if review_key in self.his_to_graph:
+            return review_key
+        # Try with zero-padding (if mapping keys are always 7 digits)
+        if len(key) < 7:
+            for k in self.his_to_graph.keys():
+                if k.endswith(key):
+                    return k
+        return None
+    
     def pad_his(self, his_ids, pad_to_len=None):
         """
         Pad or truncate a list of history IDs to a fixed length.
@@ -115,12 +131,17 @@ class PersonalDataset:
 
         # --- Graph node IDs ---
         # Map history IDs to graph node IDs via loaded mapping
-        graph_node_ids_list = [
-            self.his_to_graph.get(str(hid), 0)
-            for hid in his_id_list
-        ]
+        graph_node_ids_list = []
+        for hid in his_id_list:
+            norm_key = self.normalize_his_id(hid)
+            node_id = self.his_to_graph.get(norm_key, 0)
+            graph_node_ids_list.append(node_id)
+            # Debug: print if mapping is missing
+            if idx < 3 and node_id == 0:
+                print(f"[DEBUG] his_id {hid} (norm_key={norm_key}) missing in his_to_graph mapping.")
+
         if not graph_node_ids_list:
-            graph_node_ids_list = [0]  # fallback placeholder (node 0)
+            graph_node_ids_list = [0]
         graph_node_ids = torch.tensor(graph_node_ids_list, dtype=torch.long)
 
         # --- Tokenize for LLM backbone ---

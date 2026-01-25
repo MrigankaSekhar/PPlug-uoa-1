@@ -3,6 +3,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import SequenceClassifierOutput
 import os
 import numpy as np
+import json
 
 class PersonalLLM_Slim(nn.Module):
     """
@@ -46,8 +47,8 @@ class PersonalLLM_Slim(nn.Module):
         self.use_gate = use_gate
 
         # === Load memmap history ===
-        train_npy_path = f"../bge_emb/task_{task_id}_train_bge.npy"
-        dev_npy_path   = f"../bge_emb/task_{task_id}_dev_bge.npy"
+        train_npy_path = f"../bge_emb/task_{task_id}_train_bge.memmap.npy"
+        dev_npy_path   = f"../bge_emb/task_{task_id}_dev_bge.memmap.npy"
 
         # 🧭 These files contain precomputed sentence / profile embeddings (from the BGE model)
         #    stored as NumPy memory maps for fast random access. Each row corresponds to
@@ -77,8 +78,22 @@ class PersonalLLM_Slim(nn.Module):
 
         if not (os.path.exists(train_npy_path) and os.path.exists(dev_npy_path)):
             raise FileNotFoundError("Memmap files missing — run conversion first.")
-        self.his_train_memmap = np.load(train_npy_path, mmap_mode='r')
-        self.his_dev_memmap   = np.load(dev_npy_path,   mmap_mode='r')
+
+        # Load meta for train memmap
+        meta_path = train_npy_path.replace('_bge.memmap.npy', '_offsets.json')
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+        total_vectors = meta["total_vectors"]
+        dim = meta["dim"]
+
+        self.his_train_memmap = np.memmap(train_npy_path, mode='r', dtype='float32', shape=(total_vectors, dim))
+        # Same fix for dev
+        dev_meta_path = dev_npy_path.replace('_bge.memmap.npy', '_offsets.json')
+        with open(dev_meta_path, 'r') as f:
+            dev_meta = json.load(f)
+        dev_total_vectors = dev_meta["total_vectors"]
+        dev_dim = dev_meta["dim"]
+        self.his_dev_memmap = np.memmap(dev_npy_path, mode='r', dtype='float32', shape=(dev_total_vectors, dev_dim))
 
         # === Load memmap graph ===
         graph_path = f"../graph_emb/task_{task_id}_graph.npy"
@@ -385,6 +400,14 @@ class PersonalLLM_Slim(nn.Module):
                 p_flat = profile_embs.mean(dim=1) if profile_embs.ndim == 3 else profile_embs
                 g_flat = graph_embs.mean(dim=1) if graph_embs.ndim == 3 else graph_embs
                 if p_flat.size(-1) == g_flat.size(-1):
+                    for i in range(min(3, p_flat.size(0))):  # Print up to 3 samples
+                        print(f"[DEBUG] Sample {i}:")
+                        print(f"  his_id (profile): {his_id[i].tolist()}")
+                        if graph_node_ids is not None:
+                            print(f"  graph_node_ids:   {graph_node_ids[i].tolist()}")
+                        print(f"  Profile emb norm: {p_flat[i].norm().item():.4f}")
+                        print(f"  Graph emb norm:   {g_flat[i].norm().item():.4f}")
+                        print(f"  Cosine similarity: {torch.nn.functional.cosine_similarity(p_flat[i].unsqueeze(0), g_flat[i].unsqueeze(0)).item():.4f}")
                     cos_sim = torch.nn.functional.cosine_similarity(p_flat, g_flat, dim=-1)
                     mean_cos = cos_sim.mean().item()
                     std_cos = cos_sim.std().item()
@@ -392,7 +415,6 @@ class PersonalLLM_Slim(nn.Module):
                 else:
                     # Prevent mismatch crashes (debug only)
                     print(f"[Cosine‑Check‑Skipped] dim mismatch: profile={p_flat.size(-1)}, graph={g_flat.size(-1)}")
-
         # ==========================================================
         # 🔹 6) COMBINE SIGNALS + CONTINUE EXACTLY LIKE BEFORE
         # ==========================================================
