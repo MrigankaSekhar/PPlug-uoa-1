@@ -376,8 +376,15 @@ def main():
     device = pick_device(args.device)
     print(f"Using device: {device}")
 
+    # PATCH: Use FP16 if CUDA, else FP32
+    if device.type == "cuda":
+        print("[INFO] Using FP16 precision for CUDA device.")
+        model = AutoModel.from_pretrained(args.model, torch_dtype=torch.float16).to(device)
+    else:
+        print("[INFO] Using FP32 precision for non-CUDA device.")
+        model = AutoModel.from_pretrained(args.model, torch_dtype=torch.float32).to(device)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModel.from_pretrained(args.model).to(device)
 
     ensure_dir(args.out_dir)
     for split in args.splits:

@@ -55,9 +55,21 @@ try:
         task_id=TASK_ID
     ).to(DEVICE)
     state_dict = torch.load(f"{CHECKPOINT_PATH}/pytorch_model.bin", map_location=DEVICE)
-    personal_model.load_state_dict(state_dict, strict=False)
+    # --- PATCH: Ignore vocab shape mismatches for Flan-T5 ---
+    skip_prefixes = [
+        "llm_model.shared.weight",
+        "llm_model.encoder.embed_tokens.weight",
+        "llm_model.decoder.embed_tokens.weight",
+        "llm_model.lm_head.weight"
+    ]
+    filtered_state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in skip_prefixes)}
+    missing, unexpected = personal_model.load_state_dict(filtered_state_dict, strict=False)
+    print("✅ Loaded checkpoint (vocab shape differences safely ignored)")
+    if missing:
+        print(f"ℹ️ Missing keys: {len(missing)} → {missing[:8]}{'...' if len(missing)>8 else ''}")
+    if unexpected:
+        print(f"ℹ️ Unexpected keys: {len(unexpected)} → {unexpected[:8]}{'...' if len(unexpected)>8 else ''}")
     personal_model.eval()
-    print(f"✅ Loaded fine‑tuned checkpoint from {CHECKPOINT_PATH}")
 except Exception as e:
     print(f"⚠️ Could not load checkpoint ({e}). Using untrained fallback.")
     personal_model = PersonalLLM_Slim(
@@ -87,8 +99,25 @@ else:
 # -------------------------------------------------------------------------
 # 📑 Example user & review IDs (confirmed valid IDs)
 # -------------------------------------------------------------------------
-user_id = "90001"           # from training example
-profile_his_ids = ["1001", "1002", "1003"]
+# Automatically pick a valid user and profile_his_ids from offsets file
+with open("../bge_emb/task_3_train_offsets.json") as f:
+    offsets = json.load(f)
+
+# Find the first entry with enough profile IDs
+user_entry = None
+for entry in offsets["entries"]:
+    if len(entry["profile_id"]) >= MAX_HIS_LEN:
+        user_entry = entry
+        break
+
+if user_entry is None:
+    raise ValueError("No user found with enough profile reviews in offsets file.")
+
+user_id = user_entry["profile_id"][0]  # Use the first profile_id as user_id (or use question_index if needed)
+profile_his_ids = user_entry["profile_id"][:MAX_HIS_LEN]  # Truncate to MAX_HIS_LEN
+
+print(f"✅ Picked user_id: {user_id}")
+print(f"✅ Picked profile_his_ids: {profile_his_ids}")
 
 # -------------------------------------------------------------------------
 # 🔄 Load mapping files safely
@@ -134,15 +163,13 @@ print(f"🔗 Review node indices for user {user_id}: {review_node_indices}")
 memmap_size = getattr(personal_model, "his_train_memmap", torch.zeros((1,))).shape[0]
 valid_indices = []
 
-for hid in profile_his_ids:
-    if id_map_is_list:
-        try:
-            idx = int(hid)
-            if 0 <= idx < memmap_size:
-                valid_indices.append(idx)
-        except Exception:
-            continue
-    elif isinstance(id_to_index, dict):
+# --- PATCH: Use review_node_indices directly if id_to_index is a list ---
+if id_map_is_list:
+    # Only keep indices that are valid for the memmap size
+    valid_indices = [idx for idx in review_node_indices if isinstance(idx, int) and 0 <= idx < memmap_size]
+else:
+    # If id_to_index is a dict, map profile_his_ids to indices and check validity
+    for hid in profile_his_ids:
         cand = id_to_index.get(hid) or id_to_index.get(str(hid)) or id_to_index.get(f"review_{hid}")
         if cand is not None and isinstance(cand, int) and 0 <= cand < memmap_size:
             valid_indices.append(cand)
@@ -171,25 +198,40 @@ def run_llm_base(prompt: str) -> str:
     return llm_tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
 def run_personal(prompt: str, his_id: torch.Tensor) -> str:
-    """Generate using personalized LLM."""
+    """Generate using personalized LLM (correct tokenizers, labels=None)."""
+    llm_inp = llm_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     emb_inp = emb_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     try:
+        # Try with labels=None (inference mode)
         _, seqs = personal_model.forward(
-            llm_input_ids=emb_inp["input_ids"],
-            llm_attention_mask=emb_inp["attention_mask"],
-            labels=torch.zeros_like(emb_inp["input_ids"]),
+            llm_input_ids=llm_inp["input_ids"],
+            llm_attention_mask=llm_inp["attention_mask"],
+            labels=None,
             emb_input_ids=emb_inp["input_ids"],
             emb_attention_mask=emb_inp["attention_mask"],
             emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
             his_id=his_id,
         )
-        return llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-    except Exception as e:
-        print("⚠️ Personal forward failed:", e)
-        return "(error during generation)"
+    except AttributeError as e:
+        # Fallback: pass a dummy tensor if labels=None causes error
+        if "'NoneType' object has no attribute 'long'" in str(e):
+            dummy_labels = torch.zeros_like(llm_inp["input_ids"])
+            _, seqs = personal_model.forward(
+                llm_input_ids=llm_inp["input_ids"],
+                llm_attention_mask=llm_inp["attention_mask"],
+                labels=dummy_labels,
+                emb_input_ids=emb_inp["input_ids"],
+                emb_attention_mask=emb_inp["attention_mask"],
+                emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
+                his_id=his_id,
+            )
+        else:
+            raise
+    return llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
 
 def run_personal_graph(prompt: str, his_id: torch.Tensor):
-    """Generate using personalized+graph model, return gate average."""
+    """Generate using personalized+graph model, return gate average (correct tokenizers)."""
+    llm_inp = llm_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     emb_inp = emb_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     task_emb = _sanitize(personal_model.obtain_task_emb(
         emb_inp["input_ids"], emb_inp["attention_mask"],
@@ -217,27 +259,43 @@ def run_personal_graph(prompt: str, his_id: torch.Tensor):
         gate_val = 0.0
     gate_val = 0.0 if math.isnan(gate_val) else gate_val
     try:
+        # Try with labels=None (inference mode)
         _, seqs = personal_model.forward(
-            emb_inp["input_ids"], emb_inp["attention_mask"],
-            labels=torch.zeros_like(emb_inp["input_ids"]),
+            llm_input_ids=llm_inp["input_ids"],
+            llm_attention_mask=llm_inp["attention_mask"],
+            labels=None,
             emb_input_ids=emb_inp["input_ids"],
             emb_attention_mask=emb_inp["attention_mask"],
             emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
             his_id=his_id,
         )
         text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-    except Exception as e:
-        print("⚠️ Graph‑persona forward failed:", e)
-        text = "(error during graph generation)"
+    except AttributeError as e:
+        if "'NoneType' object has no attribute 'long'" in str(e):
+            dummy_labels = torch.zeros_like(llm_inp["input_ids"])
+            _, seqs = personal_model.forward(
+                llm_input_ids=llm_inp["input_ids"],
+                llm_attention_mask=llm_inp["attention_mask"],
+                labels=dummy_labels,
+                emb_input_ids=emb_inp["input_ids"],
+                emb_attention_mask=emb_inp["attention_mask"],
+                emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
+                his_id=his_id,
+            )
+            text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
+        else:
+            raise
     return text, gate_val
 
 # -------------------------------------------------------------------------
 # 🧪 PROMPTS FOR DEMO
 # -------------------------------------------------------------------------
 test_prompts = [
-    "Predict the product rating (1–5): The story was fun but predictable.",
-    "Predict the delivery satisfaction score (1–5): The shipping was fast!",
-    "Predict the outdoor gear quality rating (1–5): This tent survived heavy rain."
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The story was fun but predictable.",
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The shipping was fast!",
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: This tent survived heavy rain.",
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: It is difficult to believe that this was produced by an adult.  It lacks finesse, style and cohesiveness.  The dialogue is stilted and painful to read. I almost tossed it aside after the first few pages.  I can find no redeeming qualities in this offering.",
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: every few days it stops connecting to the internet and you have to restart it not likeing that especially since its slow on start up and fire fox is the only browser that works on it"
 ]
 
 # -------------------------------------------------------------------------
