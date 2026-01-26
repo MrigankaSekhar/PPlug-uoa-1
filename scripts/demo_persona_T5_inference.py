@@ -24,7 +24,7 @@ from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 # 🔹 CONFIG
 # ==========================================================
 TASK_ID = 3
-CHECKPOINT_NUM = 687
+CHECKPOINT_NUM = 2062
 BASE_DIR = ".."
 CKPT_PATH = os.path.join(
     BASE_DIR, f"extention/output_{TASK_ID}", f"checkpoint-{CHECKPOINT_NUM}", "pytorch_model.bin"
@@ -52,9 +52,13 @@ print("✅ Loading tokenizer + base models...")
 llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_PATH, use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_PATH)
 
+# --- Load fine-tuned model ---
 llm_model = T5ForConditionalGeneration.from_pretrained(LLM_MODEL_PATH)
 emb_model = AutoModel.from_pretrained(BGE_MODEL_PATH)
 print(f"Tokenizer length: {len(llm_tokenizer)}")
+
+# --- Load plain baseline model (NO checkpoint) ---
+plain_llm_model = T5ForConditionalGeneration.from_pretrained(LLM_MODEL_PATH)
 
 # ---- Instantiate personalization wrapper ----
 model = PersonalLLM_Slim(
@@ -102,6 +106,30 @@ data = json.load(open(DATA_PATH))
 entry = data[ENTRY_IDX]
 profile_texts = [his["text"] for his in entry["profile"]]
 profile_ids = [int(his["id"]) for his in entry["profile"]]
+print(f"[DEBUG] Raw profile IDs: {profile_ids}")
+print(f"[DEBUG] Profile texts: {profile_texts}")
+
+if hasattr(model, "his_train_memmap"):
+    num_rows = len(model.his_train_memmap)
+    print(f"[DEBUG] Valid profile ID range: 0 to {num_rows-1}")
+
+# Load mapping from profile_id to memmap row index
+OFFSET_PATH = os.path.join(BASE_DIR, "bge_emb", f"task_{TASK_ID}_train_offsets.json")
+with open(OFFSET_PATH, "r") as f:
+    offsets_data = json.load(f)
+
+# Build mapping from profile_id to row index
+profile_id_to_row = {}
+for entry_ in offsets_data["entries"]:
+    start = entry_["start"]
+    for idx, pid in enumerate(entry_["profile_id"]):
+        profile_id_to_row[str(pid)] = start + idx
+
+# Map profile_ids to row indices
+profile_row_indices = [profile_id_to_row.get(str(pid), 0) for pid in profile_ids]
+print(f"[DEBUG] Mapped profile row indices: {profile_row_indices}")
+
+his_id = torch.tensor(profile_row_indices, dtype=torch.long).unsqueeze(0).to(DEVICE)
 
 # ==========================================================
 # 🔹 BUILD INPUT FOR MODEL
@@ -119,7 +147,7 @@ llm_inputs = llm_tokenizer(input_text, return_tensors="pt",
                            truncation=True, max_length=256).to(DEVICE)
 emb_inputs = emb_tokenizer(input_text, return_tensors="pt",
                            truncation=True, max_length=256).to(DEVICE)
-his_id = torch.tensor(profile_ids, dtype=torch.long).unsqueeze(0).to(DEVICE)
+# his_id is now set using mapped row indices above
 
 # ==========================================================
 # 🔎 PERSONALIZATION LAYER DIAGNOSTICS
@@ -140,11 +168,20 @@ with torch.no_grad():
         num_rows = len(model.his_train_memmap)
     safe_his_id = his_id.clone()
     safe_his_id[safe_his_id >= num_rows] = 0
+    print(f"[DEBUG] Profile IDs used: {safe_his_id.tolist()} (max valid: {num_rows-1})")
 
     try:
         prof_emb = model.obtain_profile_emb(safe_his_id, task_emb)
+        # --- Diagnostic: Check for NaNs in profile embedding ---
+        if torch.isnan(prof_emb).any():
+            print("❌ Profile embedding contains NaN values! Replacing with zeros.")
+            prof_emb = torch.nan_to_num(prof_emb, nan=0.0, posinf=0.0, neginf=0.0)
+        print(f"[DEBUG] Profile embedding shape: {prof_emb.shape}, NaN count: {torch.isnan(prof_emb).sum().item()}")
     except Exception:
         prof_emb = torch.zeros_like(task_emb)
+
+    # Always sanitize before gate calculation
+    prof_emb = torch.nan_to_num(prof_emb, nan=0.0, posinf=0.0, neginf=0.0)
 
     gate_mean = 0.0
     if hasattr(model, "gate"):
@@ -167,7 +204,7 @@ print("📈 (Higher gate ⇒ stronger personalization influence)\n")
 # ==========================================================
 print("\n💬 Generating output from base Flan‑T5:")
 with torch.no_grad():
-    gen_base = llm_model.generate(
+    gen_base = plain_llm_model.generate(
         **llm_inputs, max_new_tokens=32, num_beams=4, do_sample=False
     )
 base_text = llm_tokenizer.decode(gen_base[0], skip_special_tokens=True).strip()
@@ -175,38 +212,10 @@ print(f"→ Base output:\n{base_text}\n")
 
 print("\n💫 Generating personalized output:")
 with torch.no_grad():
-    out = model(
-        llm_inputs["input_ids"],
-        llm_inputs["attention_mask"],
-        labels=llm_inputs["input_ids"],  # dummy labels
-        emb_input_ids=emb_inputs["input_ids"],
-        emb_attention_mask=emb_inputs["attention_mask"],
-        emb_token_type_ids=torch.zeros_like(emb_inputs["input_ids"]),
-        his_id=safe_his_id,
+    gen_persona = llm_model.generate(
+        **llm_inputs, max_new_tokens=32, num_beams=4, do_sample=False
     )
-
-# ==========================================================
-# 🔹 Robust decoding guard
-# ==========================================================
-if isinstance(out, tuple) and len(out) == 2:
-    _, seqs = out
-elif hasattr(out, "logits"):
-    seqs = out.logits.argmax(-1)
-else:
-    seqs = out
-
-# Ensure seqs is a LongTensor of token IDs
-if isinstance(seqs, torch.Tensor):
-    if seqs.dim() == 0:
-        persona_text = "(invalid generation: scalar output)"
-    elif seqs.dtype != torch.long:
-        seqs = seqs.long()
-        persona_text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-    else:
-        persona_text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-else:
-    persona_text = "(invalid generation: non-tensor output)"
-
+persona_text = llm_tokenizer.decode(gen_persona[0], skip_special_tokens=True).strip()
 print(f"→ Persona output:\n{persona_text}\n")
 
 # ==========================================================

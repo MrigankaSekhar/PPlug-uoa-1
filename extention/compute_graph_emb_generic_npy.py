@@ -412,6 +412,15 @@ def compute_metrics_only(num_nodes):
     # Optionally, print node types for these indices
     print("✅ Node count",num_nodes)
 
+def cleanup_gnn_checkpoints(graph_dir):
+    """Remove all GNN checkpoint .pt files after final embedding is saved."""
+    removed = 0
+    for fname in os.listdir(graph_dir):
+        if fname.startswith("graphsage_epoch") and fname.endswith(".pt"):
+            os.remove(os.path.join(graph_dir, fname))
+            removed += 1
+    print(f"🧹 Removed {removed} GNN checkpoint files from {graph_dir}")
+
 
 def compute_graph_metrics(edge_index, num_nodes):
     """
@@ -483,6 +492,7 @@ if __name__ == "__main__":
         train_gnn(edge_index, edge_weight, num_nodes)
     elif args.stage == "infer":
         infer_gnn(edge_index, edge_weight, num_nodes, his_to_graph)
+        cleanup_gnn_checkpoints(GRAPH_DIR)
     elif args.stage == "metrics":
         compute_metrics_only(num_nodes)
         compute_graph_metrics(edge_index, num_nodes)
