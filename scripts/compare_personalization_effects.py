@@ -11,6 +11,10 @@ Purpose:
 """
 
 import os, sys, json, math, torch
+import random
+import re
+import numpy as np
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from transformers import AutoTokenizer, T5ForConditionalGeneration, AutoModel
 torch.set_grad_enabled(False)
 
@@ -28,9 +32,25 @@ except ImportError:
 # 🔧 CONFIG
 # -------------------------------------------------------------------------
 TASK_ID = 3
-CHECKPOINT_PATH = "../extention/output_3/checkpoint-2062"
+CHECKPOINT_PATH = "../extention/output_3/checkpoint-129"
 MAX_HIS_LEN = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -------------------------------------------------------------------------
+# 🔧 DEMO MODES (what to print)
+# -------------------------------------------------------------------------
+SHOW_BASE = True
+SHOW_PERSONA_REAL = True
+SHOW_PERSONA_EMPTY = False
+SHOW_GRAPH = False   
+
+
+# -------------------------------------------------------------------------
+# 🔧 DEV GOLD EVAL (optional)
+# -------------------------------------------------------------------------
+USE_DEV_GOLD = True
+DEV_SUBSET = True
+DEV_SAMPLE_SIZE = 8
 
 # -------------------------------------------------------------------------
 # 🧠 LOAD MODELS
@@ -46,39 +66,14 @@ emb_model = AutoModel.from_pretrained(emb_model_path)
 # -------------------------------------------------------------------------
 # 🚀 LOAD PERSONALIZED MODEL
 # -------------------------------------------------------------------------
-try:
-    personal_model = PersonalLLM_Slim(
-        llm_model=llm_model,
-        emb_model=emb_model,
-        max_input_len=256,
-        max_new_len=64,
-        task_id=TASK_ID
-    ).to(DEVICE)
-    state_dict = torch.load(f"{CHECKPOINT_PATH}/pytorch_model.bin", map_location=DEVICE)
-    # --- PATCH: Ignore vocab shape mismatches for Flan-T5 ---
-    skip_prefixes = [
-        "llm_model.shared.weight",
-        "llm_model.encoder.embed_tokens.weight",
-        "llm_model.decoder.embed_tokens.weight",
-        "llm_model.lm_head.weight"
-    ]
-    filtered_state_dict = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in skip_prefixes)}
-    missing, unexpected = personal_model.load_state_dict(filtered_state_dict, strict=False)
-    print("✅ Loaded checkpoint (vocab shape differences safely ignored)")
-    if missing:
-        print(f"ℹ️ Missing keys: {len(missing)} → {missing[:8]}{'...' if len(missing)>8 else ''}")
-    if unexpected:
-        print(f"ℹ️ Unexpected keys: {len(unexpected)} → {unexpected[:8]}{'...' if len(unexpected)>8 else ''}")
-    personal_model.eval()
-except Exception as e:
-    print(f"⚠️ Could not load checkpoint ({e}). Using untrained fallback.")
-    personal_model = PersonalLLM_Slim(
-        llm_model=llm_model,
-        emb_model=emb_model,
-        max_input_len=256,
-        max_new_len=64,
-        task_id=TASK_ID
-    ).to(DEVICE).eval()
+personal_model = PersonalLLM_Slim(
+    llm_model=llm_model,
+    emb_model=emb_model,
+    max_input_len=256,
+    max_new_len=64,
+    task_id=TASK_ID
+).to(DEVICE)
+personal_model.llm_tokenizer = llm_tokenizer
 
 # -------------------------------------------------------------------------
 # 🌐 GRAPH ENCODER (optional)
@@ -188,6 +183,71 @@ his_id_empty = torch.zeros_like(his_id_real)
 def _sanitize(t: torch.Tensor):
     return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
 
+def extract_numeric_rating(text: str):
+    m = re.search(r"\b([1-5])(\.0+)?\b", str(text))
+    return int(m.group(1)) if m else None
+
+def _seqs_to_text(seqs) -> str:
+    """
+    PersonalLLM_Slim.forward() may return:
+      - token id tensors (typical HF generate), or
+      - already-decoded strings / list[str] (custom model code).
+    This helper normalizes to a string safely.
+    """
+    if seqs is None:
+        return ""
+
+    first = seqs[0] if isinstance(seqs, (list, tuple)) else seqs
+
+    # Case 1: already a python string
+    if isinstance(first, str):
+        return first.strip()
+
+    # Case 2: list of ints
+    if isinstance(first, list) and (len(first) == 0 or isinstance(first[0], int)):
+        return llm_tokenizer.decode(first, skip_special_tokens=True).strip()
+
+    # Case 3: torch tensor / numpy array of ids
+    if torch.is_tensor(first):
+        ids = first.detach().cpu().tolist()
+        return llm_tokenizer.decode(ids, skip_special_tokens=True).strip()
+
+    # Fallback: stringify
+    return str(first).strip()
+
+def _forward_out_to_text(out) -> str:
+    """
+    Handles various PersonalLLM_Slim.forward() return formats:
+      - (loss, seqs)
+      - (loss, logits)
+      - {'loss':..., 'logits':...}
+    If logits are returned, decodes only the FIRST generated token (rating).
+    """
+    if out is None:
+        return ""
+
+    def _decode_first_from_logits(logits: torch.Tensor) -> str:
+        # logits: (B, T, V) -> take first position only
+        first_token_id = logits[:, 0, :].argmax(dim=-1)  # (B,)
+        return llm_tokenizer.decode(first_token_id[0].detach().cpu().tolist(), skip_special_tokens=True).strip()
+
+    # dict output
+    if isinstance(out, dict):
+        if "sequences" in out:
+            return _seqs_to_text(out["sequences"])
+        if "logits" in out and torch.is_tensor(out["logits"]) and out["logits"].dim() == 3:
+            return _decode_first_from_logits(out["logits"])
+        return str(out).strip()
+
+    # tuple/list output
+    if isinstance(out, (list, tuple)) and len(out) >= 2:
+        second = out[1]
+        if torch.is_tensor(second) and second.dim() == 3:
+            return _decode_first_from_logits(second)
+        return _seqs_to_text(second)
+
+    return str(out).strip()
+
 # -------------------------------------------------------------------------
 # 🔧 Generation helpers
 # -------------------------------------------------------------------------
@@ -198,119 +258,167 @@ def run_llm_base(prompt: str) -> str:
     return llm_tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
 def run_personal(prompt: str, his_id: torch.Tensor) -> str:
-    """Generate using personalized LLM (correct tokenizers, labels=None)."""
     llm_inp = llm_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     emb_inp = emb_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
-    try:
-        # Try with labels=None (inference mode)
-        _, seqs = personal_model.forward(
-            llm_input_ids=llm_inp["input_ids"],
-            llm_attention_mask=llm_inp["attention_mask"],
-            labels=None,
-            emb_input_ids=emb_inp["input_ids"],
-            emb_attention_mask=emb_inp["attention_mask"],
-            emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
-            his_id=his_id,
-        )
-    except AttributeError as e:
-        # Fallback: pass a dummy tensor if labels=None causes error
-        if "'NoneType' object has no attribute 'long'" in str(e):
-            dummy_labels = torch.zeros_like(llm_inp["input_ids"])
-            _, seqs = personal_model.forward(
-                llm_input_ids=llm_inp["input_ids"],
-                llm_attention_mask=llm_inp["attention_mask"],
-                labels=dummy_labels,
-                emb_input_ids=emb_inp["input_ids"],
-                emb_attention_mask=emb_inp["attention_mask"],
-                emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
-                his_id=his_id,
-            )
-        else:
-            raise
-    return llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
 
-def run_personal_graph(prompt: str, his_id: torch.Tensor):
-    """Generate using personalized+graph model, return gate average (correct tokenizers)."""
+    dummy_labels = torch.zeros_like(llm_inp["input_ids"])
+
+    out = personal_model.forward(
+        llm_input_ids=llm_inp["input_ids"],
+        llm_attention_mask=llm_inp["attention_mask"],
+        labels=dummy_labels,
+        emb_input_ids=emb_inp["input_ids"],
+        emb_attention_mask=emb_inp["attention_mask"],
+        emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
+        his_id=his_id,
+    )
+    return _forward_out_to_text(out)
+
+def run_personal_graph(prompt: str, his_id: torch.Tensor, graph_node_ids: torch.Tensor = None, session_ids: torch.Tensor = None):
     llm_inp = llm_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
     emb_inp = emb_tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(DEVICE)
-    task_emb = _sanitize(personal_model.obtain_task_emb(
-        emb_inp["input_ids"], emb_inp["attention_mask"],
-        torch.zeros_like(emb_inp["input_ids"])
-    ))
-    prof_emb = _sanitize(personal_model.obtain_profile_emb(his_id, task_emb))
-    # --- PATCH: Use review_node_indices for graph embedding if available ---
-    if graph_encoder and any(idx >= 0 for idx in review_node_indices):
-        try:
-            graph_tensor = torch.tensor([review_node_indices], dtype=torch.long, device=DEVICE)
-            graph_emb = _sanitize(graph_encoder(graph_tensor))
-        except Exception:
-            graph_emb = torch.zeros_like(prof_emb)
+
+    dummy_labels = torch.zeros_like(llm_inp["input_ids"])
+
+    forward_kwargs = dict(
+        llm_input_ids=llm_inp["input_ids"],
+        llm_attention_mask=llm_inp["attention_mask"],
+        labels=dummy_labels,
+        emb_input_ids=emb_inp["input_ids"],
+        emb_attention_mask=emb_inp["attention_mask"],
+        emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
+        his_id=his_id,
+    )
+
+    if graph_node_ids is not None:
+        forward_kwargs["graph_node_ids"] = graph_node_ids.to(DEVICE)
+
+    if session_ids is not None:
+        forward_kwargs["session_ids"] = session_ids.to(DEVICE)
+
+    _, seqs = personal_model.forward(**forward_kwargs)
+    return _seqs_to_text(seqs)
+
+
+# -------------------------------------------------------------------------
+# 🧪 PROMPTS FOR DEMO / OR DEV SET SAMPLING
+# -------------------------------------------------------------------------
+if USE_DEV_GOLD:
+    if DEV_SUBSET:
+        questions_path = "../LaMP_time_3_subset/dev_questions.json"
+        outputs_path   = "../LaMP_time_3_subset/dev_outputs.json"
     else:
-        graph_emb = torch.zeros_like(prof_emb)
-    fused_emb = torch.cat([prof_emb, graph_emb], dim=-1)
-    if fused_emb.size(-1) != task_emb.size(-1):
-        W = torch.randn(task_emb.size(-1), fused_emb.size(-1), device=fused_emb.device)
-        fused_emb = torch.nn.functional.linear(fused_emb, W)
-    fused_emb = _sanitize(fused_emb)
-    gate_input = _sanitize(torch.cat([task_emb, fused_emb], dim=-1))
-    try:
-        gate_val = float(torch.sigmoid(personal_model.gate(gate_input)).mean().item())
-    except Exception:
-        gate_val = 0.0
-    gate_val = 0.0 if math.isnan(gate_val) else gate_val
-    try:
-        # Try with labels=None (inference mode)
-        _, seqs = personal_model.forward(
-            llm_input_ids=llm_inp["input_ids"],
-            llm_attention_mask=llm_inp["attention_mask"],
-            labels=None,
-            emb_input_ids=emb_inp["input_ids"],
-            emb_attention_mask=emb_inp["attention_mask"],
-            emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
-            his_id=his_id,
-        )
-        text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-    except AttributeError as e:
-        if "'NoneType' object has no attribute 'long'" in str(e):
-            dummy_labels = torch.zeros_like(llm_inp["input_ids"])
-            _, seqs = personal_model.forward(
-                llm_input_ids=llm_inp["input_ids"],
-                llm_attention_mask=llm_inp["attention_mask"],
-                labels=dummy_labels,
-                emb_input_ids=emb_inp["input_ids"],
-                emb_attention_mask=emb_inp["attention_mask"],
-                emb_token_type_ids=torch.zeros_like(emb_inp["input_ids"]),
-                his_id=his_id,
-            )
-            text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
-        else:
-            raise
-    return text, gate_val
+        questions_path = "../LaMP_time_3/dev_questions.json"
+        outputs_path   = "../LaMP_time_3/dev_outputs.json"
+
+    if not (os.path.exists(questions_path) and os.path.exists(outputs_path)):
+        raise FileNotFoundError(f"Missing dev files: {questions_path} or {outputs_path}")
+
+    with open(questions_path, "r") as fq:
+        questions_data = json.load(fq)
+    with open(outputs_path, "r") as fo:
+        outputs_data = json.load(fo)
+
+    id_to_gold = {g["id"]: str(g["output"]).strip() for g in outputs_data.get("golds", [])}
+
+    # sample entries that have gold
+    candidates = [q for q in questions_data if q.get("id") in id_to_gold]
+    if not candidates:
+        raise ValueError("No dev questions matched gold IDs.")
+
+    sampled = random.sample(candidates, k=min(DEV_SAMPLE_SIZE, len(candidates)))
+
+    # Each item: {"id","prompt","gold"}
+    test_items = []
+    for q in sampled:
+        qid = q.get("id")
+        prompt = q.get("input", "")
+        gold = id_to_gold.get(qid, "")
+        test_items.append({"id": qid, "prompt": prompt, "gold": gold})
+else:
+    test_items = [{"id": None, "prompt": p, "gold": None} for p in [
+        "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The story was fun but predictable.",
+        "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The shipping was fast!",
+        "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: This tent survived heavy rain.",
+    ]]
 
 # -------------------------------------------------------------------------
-# 🧪 PROMPTS FOR DEMO
+# 📊 COMPARISON RUN (+ GOLD)
 # -------------------------------------------------------------------------
-test_prompts = [
-    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The story was fun but predictable.",
-    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: The shipping was fast!",
-    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: This tent survived heavy rain.",
-    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: It is difficult to believe that this was produced by an adult.  It lacks finesse, style and cohesiveness.  The dialogue is stilted and painful to read. I almost tossed it aside after the first few pages.  I can find no redeeming qualities in this offering.",
-    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5 without further explanation. review: every few days it stops connecting to the internet and you have to restart it not likeing that especially since its slow on start up and fire fox is the only browser that works on it"
-]
+rows = []
+
+for item in test_items:
+    prompt = item["prompt"]
+    gold = item["gold"]
+    qid = item["id"]
+
+    print(f"\n🧾 ID: {qid} | Prompt: {prompt}")
+    if gold is not None:
+        print(f"  GOLD                        → {gold}")
+
+    out_base = out_pers = out_emp = out_graph = None
+
+    if SHOW_BASE:
+        out_base = run_llm_base(prompt)
+        print(f"  BASE (Flan‑T5)               → {out_base}")
+
+    if SHOW_PERSONA_REAL:
+        out_pers = run_personal(prompt, his_id_real)
+        print(f"  Personalized (Real Persona)  → {out_pers}")
+
+    if SHOW_PERSONA_EMPTY:
+        out_emp = run_personal(prompt, his_id_empty)
+        print(f"  Personalized (Empty Persona) → {out_emp}")
+
+    if SHOW_GRAPH:
+        graph_ids_tensor = torch.tensor([review_node_indices], dtype=torch.long, device=DEVICE)
+        out_graph = run_personal_graph(prompt, his_id_real, graph_node_ids=graph_ids_tensor)
+        print(f"  Personalized + Graph         → {out_graph}")
+
+    rows.append({
+        "id": qid,
+        "gold": gold,
+        "base": out_base,
+        "pers": out_pers,
+        "empty": out_emp,
+        "graph": out_graph
+    })
 
 # -------------------------------------------------------------------------
-# 📊 COMPARISON RUN
+# 📈 METRICS (numeric match + RMSE/MAE) when gold exists
 # -------------------------------------------------------------------------
-for prompt in test_prompts:
-    print(f"\n🧾 Prompt: {prompt}")
-    out_base = run_llm_base(prompt)
-    out_pers = run_personal(prompt, his_id_real)
-    out_emp = run_personal(prompt, his_id_empty)
-    out_graph, gate_val = run_personal_graph(prompt, his_id_real)
-    print(f"  BASE (Flan‑T5)               → {out_base}")
-    print(f"  Personalized (Real Persona)  → {out_pers}")
-    print(f"  Personalized (Empty Persona) → {out_emp}")
-    print(f"  Personalized + Graph         → {out_graph}  | gate_avg={gate_val:.4f}")
+if USE_DEV_GOLD:
+    def _metric_block(name, preds):
+        gold_nums = []
+        pred_nums = []
+        for r in rows:
+            if r["gold"] is None:
+                continue
+            g = extract_numeric_rating(r["gold"])
+            p = extract_numeric_rating(preds(r))
+            if g is not None and p is not None:
+                gold_nums.append(g)
+                pred_nums.append(p)
+
+        if not gold_nums:
+            print(f"\n=== METRICS: {name} ===")
+            print("  (no parsable numeric pairs)")
+            return
+
+        acc = float(np.mean([int(g == p) for g, p in zip(gold_nums, pred_nums)]))
+        rmse = float(mean_squared_error(gold_nums, pred_nums, squared=False))
+        mae = float(mean_absolute_error(gold_nums, pred_nums))
+        print(f"\n=== METRICS: {name} ===")
+        print(f"  n={len(gold_nums)} | acc={acc:.3f} | rmse={rmse:.3f} | mae={mae:.3f}")
+
+    if SHOW_BASE:
+        _metric_block("BASE", lambda r: r["base"])
+    if SHOW_PERSONA_REAL:
+        _metric_block("PERSONAL (REAL)", lambda r: r["pers"])
+    if SHOW_PERSONA_EMPTY:
+        _metric_block("PERSONAL (EMPTY)", lambda r: r["empty"])
+    if SHOW_GRAPH:
+        _metric_block("PERSONAL + GRAPH", lambda r: r["graph"])
 
 # -------------------------------------------------------------------------
 # 💡 INTERPRETATION GUIDELINES

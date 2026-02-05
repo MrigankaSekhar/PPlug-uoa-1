@@ -1,7 +1,7 @@
 import torch
 import json
 from transformers import T5ForConditionalGeneration, AutoModel, AutoTokenizer
-from code.ModelForPer import PersonalLLM  # import your existing class
+from extention.ModelForPer import PersonalLLM  # import your existing class
 
 # --------------------------
 # CONFIGURATION

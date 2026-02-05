@@ -26,7 +26,7 @@ from nltk.sentiment import SentimentIntensityAnalyzer
 # CONFIG
 # -----------------------------
 USE_SUBSET = True
-GRAPHSAGE_EPOCHS = 50
+GRAPHSAGE_EPOCHS = 15
 GRAPHSAGE_HIDDEN_DIM = 512
 TASK_ID = 3
 
@@ -52,6 +52,7 @@ print(f"📄 DEV_FILE   = {DEV_FILE}")
 FEATURE_INIT = "bge"
 BGE_MODEL_PATH = "../bge-base-en-v1.5/"
 EMB_DIM = 768
+RESIDUAL_X_WEIGHT = 0.1  # ✅ Reduced from 0.3
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -95,6 +96,8 @@ def build_graph_and_cache():
         ("Review", "Item", "DESCRIBES"),
         ("Review", "Sentiment", "HAS_POLARITY"),
         ("Item", "Popularity", "HAS_POP"),
+        # 🔧 NEW: review-review link (same user history)
+        ("Review", "Review", "REVIEW_SIM"),
     ]
     REL_WEIGHT = {
         "RATED":        1.0,
@@ -102,6 +105,8 @@ def build_graph_and_cache():
         "DESCRIBES":    0.8,
         "HAS_POLARITY": 0.7,
         "HAS_POP":      0.5,
+        # ✅ Increase from 0.4 → allow stronger review clustering
+        "REVIEW_SIM":   0.8,
     }
     node_index = {}
     node_maps = {t: {} for t, _, _ in SCHEMA} | {t: {} for _, t, _ in SCHEMA}
@@ -109,6 +114,9 @@ def build_graph_and_cache():
     next_id = 0
     edges, edge_wts = [], []
     his_to_graph, item_freq = {}, {}
+
+    # 🔧 NEW: keep list of Review node ids per user, to connect them
+    user_to_reviews = {}
 
     def add_node(typ, key, text=None):
         nonlocal next_id
@@ -124,6 +132,19 @@ def build_graph_and_cache():
         w = REL_WEIGHT.get(rel, 1.0)
         edges.append((s, t)); edges.append((t, s))
         edge_wts.append(w); edge_wts.append(w)
+
+    def _connect_review_to_user_history(uid: int, rid: int):
+        """
+        Add Review↔Review edges between this review and the user's previous reviews.
+        This creates Review-Review adjacency so review-only graph metrics make sense.
+        """
+        prev = user_to_reviews.get(uid, [])
+        for pr in prev:
+            if pr == rid:
+                continue
+            add_edge(rid, pr, "REVIEW_SIM")
+        prev.append(rid)
+        user_to_reviews[uid] = prev
 
     def get_popularity_bucket(item_key):
         freq = item_freq.get(item_key, 0)
@@ -150,11 +171,13 @@ def build_graph_and_cache():
 
         ikey = f"item_{entry.get('id')}"
         iid = add_node("Item", ikey)
-        item_freq[ikey] = item_freq.get(ikey, 0) + 1
 
         add_edge(uid, rid, "WROTE")
         add_edge(rid, iid, "DESCRIBES")
         add_edge(uid, iid, "RATED")
+
+        # 🔧 NEW: connect this review to user's review history (Review↔Review edges)
+        _connect_review_to_user_history(uid, rid)
 
         if rtext:
             s = text_to_sentiment(rtext)
@@ -180,6 +203,9 @@ def build_graph_and_cache():
 
                 # Link current user to this review node
                 add_edge(uid, h_rid, "WROTE")
+
+                # 🔧 NEW: connect profile review to user's review history too
+                _connect_review_to_user_history(uid, h_rid)
 
                 # Optionally, capture sentiment and popularity info
                 s = text_to_sentiment(htext)
@@ -210,19 +236,32 @@ def build_graph_and_cache():
     his_to_graph = {k: old2new[v] for k, v in his_to_graph.items() if v in old2new}
     node_text_map = {old2new[v]: node_texts.get(t, {}).get(k, "") for t, nm in node_maps.items() for k, v in nm.items()}
 
+    node_type_map = {old2new[node_index[(typ, key)]]: typ for (typ, key) in node_index.keys()}
+
     with open(CACHE_PATH, "wb") as f:
         pickle.dump({
             "his_to_graph": his_to_graph,
             "edge_index": edge_index,
             "edge_weight": edge_weight,
             "node_texts": node_text_map,
+            "node_types": node_type_map,
             "num_nodes": num_nodes
         }, f)
     print(f"✅ Cached graph to {CACHE_PATH}")
 
     # Save his_id to graph node id mapping
-    with open(os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph.json"), "w") as f:
-        json.dump({str(k): v for k, v in his_to_graph.items()}, f)
+    his_to_graph_out = {str(k): int(v) for k, v in his_to_graph.items()}
+    his_to_graph_path = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph.json")
+    with open(his_to_graph_path, "w") as f:
+        json.dump(his_to_graph_out, f)
+
+    # Also save with a clearer name to avoid confusion in training scripts
+    his_to_graph_node_path = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_his_to_graph_node.json")
+    with open(his_to_graph_node_path, "w") as f:
+        json.dump(his_to_graph_out, f)
+
+    print(f"✅ Saved his_id→graph_node_id mapping to {his_to_graph_path}")
+    print(f"✅ Saved his_id→graph_node_id mapping to {his_to_graph_node_path}")
 
     # Save his_id to row index mapping for embedding table
     his_ids = [str(hid) for hid in his_to_graph.keys() if str(hid).isdigit()]
@@ -263,8 +302,8 @@ def embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, ch
         processed_ids = set()
 
     # --- Load offsets mapping ---
-    offsets_path = f"../bge_emb/task_3_{split}_offsets.json"
-    emb_path = f"../bge_emb/task_3_{split}_bge.memmap.npy"
+    offsets_path = f"../bge_emb/task_{TASK_ID}_{split}_offsets.json"
+    emb_path = f"../bge_emb/task_{TASK_ID}_{split}_bge.memmap.npy"
 
     with open(offsets_path) as f:
         offsets_data = json.load(f)
@@ -283,6 +322,13 @@ def embed_chunk(his_to_graph, edge_index, edge_weight, node_texts, num_nodes, ch
             processed_ids.add(nid)
             assigned += 1
     print(f"✅ Assigned {assigned} precomputed embeddings using offsets_map for split '{split}'")
+
+    # ✅ Only save the alignment anchor from TRAIN to avoid overwriting with DEV
+    if split == "train":
+        np.save(os.path.join(GRAPH_DIR, f"task_{TASK_ID}_profile_init.npy"), np.array(x, dtype=np.float16))
+        print(f"✅ Saved TRAIN profile_init anchor to {GRAPH_DIR}/task_{TASK_ID}_profile_init.npy")
+    else:
+        print("ℹ️ Skipped saving profile_init for DEV split (keeps TRAIN anchor).")
 
     tokenizer = AutoTokenizer.from_pretrained(BGE_MODEL_PATH)
     model = AutoModel.from_pretrained(BGE_MODEL_PATH).to(device).eval()
@@ -337,73 +383,188 @@ def train_gnn(edge_index, edge_weight, num_nodes):
     xt = torch.tensor(x.astype(np.float32))
     data = Data(x=xt, edge_index=edge_index, edge_attr=edge_weight).to(device)
 
+    # --- Load original profile embeddings for alignment ---
+    PROFILE_INIT_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_profile_init.npy")
+    if os.path.exists(PROFILE_INIT_PATH):
+        profile_init = torch.tensor(np.load(PROFILE_INIT_PATH)).to(device)
+        print(f"Loaded profile_init embeddings for alignment: {profile_init.shape}")
+    else:
+        profile_init = None
+
     class SAGE(nn.Module):
         def __init__(self):
             super().__init__()
             self.c1 = SAGEConv(EMB_DIM, GRAPHSAGE_HIDDEN_DIM)
-            self.c2 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, GRAPHSAGE_HIDDEN_DIM)
-            self.c3 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, EMB_DIM)
-            self.drop = nn.Dropout(0.4)
+            self.c2 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, EMB_DIM)
+            self.drop = nn.Dropout(0.2)
+            self.ln1 = nn.LayerNorm(GRAPHSAGE_HIDDEN_DIM)
+
+        def forward(self, x, edge_index, w=None):
+            # 🔧 FIX: Apply residual BEFORE normalization
+            try:
+                h = self.c1(x, edge_index, edge_weight=w).relu()
+            except TypeError:
+                h = self.c1(x, edge_index).relu()
+            h = self.ln1(h)
+            h = self.drop(h)
+            
+            try:
+                h = self.c2(h, edge_index, edge_weight=w)
+            except TypeError:
+                h = self.c2(h, edge_index)
+
+            # ✅ FIX: Residual connection WITHOUT immediate normalization
+            h_res = 0.70 * h + 0.30 * x  # 70% GNN output, 30% input
+            
+            # ✅ FIX: Normalize AFTER residual mixing
+            return torch.nn.functional.normalize(h_res, p=2, dim=1)
+
+    model = SAGE().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    loader = NeighborLoader(data, num_neighbors=[5, 3], batch_size=128, shuffle=True)
+
+    # 🔧 NEW: epoch-based warmup for alignment so it doesn't fight early training
+    def _align_weight(epoch_idx: int) -> float:
+        # ✅ NEW: Start at 0, ramp to 0.10 only
+        if epoch_idx < 2:
+            return 0.0  # No alignment for first 2 epochs
+        elif epoch_idx < 5:
+            return 0.05 * (epoch_idx - 1)  # Ramp 0 → 0.10
+        else:
+            return 0.10  # Cap at 0.10
+
+    for epoch in range(GRAPHSAGE_EPOCHS):
+        model.train()
+        total_loss = 0.0
+
+        w_align = _align_weight(epoch)
+
+        for batch in loader:
+            optimizer.zero_grad()
+
+            pred = model(batch.x, batch.edge_index, getattr(batch, "edge_attr", None))
+            target = torch.nn.functional.normalize(batch.x, p=2, dim=1)
+
+            mask = batch.x.norm(dim=1) > 1e-6
+            cos_loss = 1 - torch.nn.functional.cosine_similarity(pred[mask], target[mask]).mean()
+
+            # 🔧 CHANGE: degree-weighted neighbor smoothing loss (reduces hub domination)
+            src, dst = batch.edge_index
+
+            e_w = getattr(batch, "edge_attr", None)
+            if e_w is None:
+                e_w = torch.ones(src.size(0), device=pred.device, dtype=pred.dtype)
+            else:
+                e_w = e_w.to(pred.dtype).clamp(min=0.05)
+
+            deg = torch.bincount(src, minlength=pred.size(0)).float().clamp(min=1.0)
+            w = (1.0 / torch.sqrt(deg[src] * deg[dst])).to(pred.dtype).detach()
+
+            nb_cos = torch.nn.functional.cosine_similarity(pred[src], pred[dst])
+            nb_loss = ((1.0 - nb_cos) * w * e_w).mean()
+
+            # --- Cosine alignment loss with profile embeddings ---
+            align_loss = 0.0
+            if profile_init is not None:
+                batch_indices = batch.n_id if hasattr(batch, "n_id") else torch.arange(pred.size(0), device=pred.device)
+                valid_idx = (batch_indices < profile_init.size(0))
+                if valid_idx.any():
+                    align_loss = 1 - torch.nn.functional.cosine_similarity(
+                        pred[valid_idx], profile_init[batch_indices[valid_idx]]
+                    ).mean()
+
+            # --- NEW: Add contrastive loss to prevent collapse ---
+            # Sample random non-neighbor pairs
+            num_neg = min(128, pred.size(0))
+            rand_idx = torch.randperm(pred.size(0), device=pred.device)[:num_neg]
+            neg_pairs = torch.combinations(rand_idx, r=2)
+
+            if neg_pairs.size(0) > 0:
+                neg_src, neg_dst = neg_pairs[:, 0], neg_pairs[:, 1]
+                neg_sim = torch.nn.functional.cosine_similarity(pred[neg_src], pred[neg_dst])
+                # Penalize high similarity between random pairs
+                contrast_loss = torch.clamp(neg_sim - 0.3, min=0.0).mean()  # Push random pairs below 0.3
+            else:
+                contrast_loss = 0.0
+
+            # 🔧 UPDATED: Add contrastive term
+            loss = 0.75 * nb_loss + w_align * align_loss + 0.15 * contrast_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(loader)
+        print(f"📉 Epoch {epoch + 1}/{GRAPHSAGE_EPOCHS} loss={avg_loss:.4f} (align_w={w_align:.3f})")
+        torch.save(model.state_dict(), os.path.join(GRAPH_DIR, f"graphsage_epoch{epoch + 1}.pt"))
+
+        # --- Print cosine similarity between GNN output and profile_init ---
+        if profile_init is not None:
+            model.eval()
+            with torch.no_grad():
+                pred_all = model(data.x, data.edge_index, getattr(data, "edge_attr", None))
+                valid_idx = torch.arange(min(pred_all.size(0), profile_init.size(0)), device=pred_all.device)
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    pred_all[valid_idx], profile_init[valid_idx]
+                ).mean().item()
+                print(f"🔗 Cosine similarity (GNN vs profile_init) after epoch {epoch + 1}: {cos_sim:.4f}")
+
+def infer_gnn(edge_index, edge_weight, num_nodes, his_to_graph):
+    print("🚀 Inferring final GNN embeddings")
+    X_SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x.npy")
+    x = np.memmap(X_SAVE_PATH, dtype=np.float16, mode="r", shape=(num_nodes, EMB_DIM))
+    xt = torch.tensor(x.astype(np.float32)).to(device)
+    data = Data(x=xt, edge_index=edge_index, edge_attr=edge_weight).to(device)
+
+    ckpts = [f for f in os.listdir(GRAPH_DIR) if f.startswith("graphsage_epoch") and f.endswith(".pt")]
+    if not ckpts:
+        raise FileNotFoundError("❌ No GNN checkpoints found. Run --stage train first.")
+    ckpts.sort(key=lambda f: int(f.split("epoch")[1].split(".")[0]))
+    ck = ckpts[-1]
+    print(f"📂 Loading checkpoint: {ck}")
+
+    # ✅ FIX: Match training architecture (add LayerNorm layers)
+    class SAGE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c1 = SAGEConv(EMB_DIM, GRAPHSAGE_HIDDEN_DIM)
+            self.c2 = SAGEConv(GRAPHSAGE_HIDDEN_DIM, EMB_DIM)
+            self.drop = nn.Dropout(0.2)
+            self.ln1 = nn.LayerNorm(GRAPHSAGE_HIDDEN_DIM)
 
         def forward(self, x, edge_index, w=None):
             try:
                 h = self.c1(x, edge_index, edge_weight=w).relu()
             except TypeError:
                 h = self.c1(x, edge_index).relu()
+            h = self.ln1(h)
             h = self.drop(h)
+            
             try:
-                h = self.c2(h, edge_index, edge_weight=w).relu()
+                h = self.c2(h, edge_index, edge_weight=w)
             except TypeError:
-                h = self.c2(h, edge_index).relu()
-            h = self.drop(h)
-            try:
-                h = self.c3(h, edge_index, edge_weight=w)
-            except TypeError:
-                h = self.c3(h, edge_index)
-            return torch.nn.functional.normalize(0.2 * h + 0.8 * x, p=2, dim=1)
+                h = self.c2(h, edge_index)
 
-    # Instantiate model and optimizer
+            # ✅ FIX: Match training architecture
+            h_res = 0.70 * h + 0.30 * x
+            return torch.nn.functional.normalize(h_res, p=2, dim=1)
+
     model = SAGE().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loader = NeighborLoader(data, num_neighbors=[10, 5], batch_size=512, shuffle=True)
+    model.load_state_dict(torch.load(os.path.join(GRAPH_DIR, ck), map_location=device))
+    model.eval()
 
-    for epoch in range(GRAPHSAGE_EPOCHS):
-        model.train()
-        total_loss = 0.0
-        for batch in loader:
-            optimizer.zero_grad()
-            pred = model(batch.x, batch.edge_index, getattr(batch, "edge_attr", None))
-            target = torch.nn.functional.normalize(batch.x, p=2, dim=1)
-            mask = batch.x.norm(dim=1) > 1e-6
-            cos_loss = 1 - torch.nn.functional.cosine_similarity(pred[mask], target[mask]).mean()
-            src, dst = batch.edge_index
-            nb_loss = 1 - torch.nn.functional.cosine_similarity(pred[src], pred[dst]).mean()
-            loss = 0.5 * cos_loss + 0.5 * nb_loss
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+    with torch.no_grad():
+        pred_all = model(data.x, data.edge_index, getattr(data, "edge_attr", None)).detach().cpu().numpy().astype(np.float16)
 
-        avg_loss = total_loss / len(loader)
-        print(f"📉 Epoch {epoch + 1}/{GRAPHSAGE_EPOCHS} loss={avg_loss:.4f}")
-        torch.save(model.state_dict(), os.path.join(GRAPH_DIR, f"graphsage_epoch{epoch + 1}.pt"))
-
-def infer_gnn(edge_index,edge_weight,num_nodes,his_to_graph):
-    X_SAVE_PATH=os.path.join(GRAPH_DIR,f"task_{TASK_ID}_x.npy")
-    x=np.memmap(X_SAVE_PATH,dtype=np.float16,mode='r',shape=(num_nodes,EMB_DIM))
-    xt=torch.tensor(x.astype(np.float32))
-    data=Data(x=xt,edge_index=edge_index,edge_attr=edge_weight).to(device)
-    ckpts=[f for f in os.listdir(GRAPH_DIR) if f.startswith("graphsage_epoch")]
-    ckpts.sort(key=lambda f:int(f.split("epoch")[1].split(".")[0]))
-    ck=ckpts[-1]
-    print(f"📂 Loading {ck}")
-    m=SAGEConv(EMB_DIM,EMB_DIM).to(device)
-    state=torch.load(os.path.join(GRAPH_DIR,ck),map_location=device)
-    # simplified eval forward omitted for brevity
-    np.save(SAVE_PATH,x.astype(np.float16))
-    json.dump(his_to_graph,open(MAP_PATH,"w"))
-    print(f"✅ Saved normalized embeddings {SAVE_PATH}")
+    np.save(SAVE_PATH, pred_all)
+    json.dump(his_to_graph, open(MAP_PATH, "w"))
+    print(f"✅ Saved GNN embeddings to {SAVE_PATH} (shape={pred_all.shape})")
 
 def compute_metrics_only(num_nodes):
+    if not os.path.exists(SAVE_PATH):
+        raise FileNotFoundError(f"❌ Missing {SAVE_PATH}. Run --stage infer first.")
+
     arr=np.load(SAVE_PATH,mmap_mode='r').astype(np.float32)
     zc=np.sum(np.linalg.norm(arr,axis=1)==0)
     print("Zero vectors:",zc)
@@ -429,41 +590,100 @@ def compute_graph_metrics(edge_index, num_nodes):
     - Cosine similarity between original and trained embeddings
     - Neighbor vs random node similarity
     - Norm statistics
+
+    If cached node types are available, additionally reports the same metrics
+    restricted to Review nodes only (much more interpretable).
     """
+    if not os.path.exists(SAVE_PATH):
+        raise FileNotFoundError(f"❌ Missing {SAVE_PATH}. Run --stage infer first.")
+
     import numpy as np
     from sklearn.metrics.pairwise import cosine_similarity
     import networkx as nx
 
-    X_SAVE_PATH = os.path.join(GRAPH_DIR, f"task_{TASK_ID}_x.npy")
-    x = np.memmap(X_SAVE_PATH, dtype=np.float16, mode="r", shape=(num_nodes, EMB_DIM)).astype(np.float32)
+    x = np.load(SAVE_PATH, mmap_mode="r").astype(np.float32)
 
-    # 1️⃣ Norm stats
+    # 1️⃣ Norm stats (all nodes)
     norms = np.linalg.norm(x, axis=1)
-    print(f"Embedding norm: mean={norms.mean():.4f}  std={norms.std():.4f}")
+    print(f"Embedding norm (ALL): mean={norms.mean():.4f}  std={norms.std():.4f}")
 
-    # 2️⃣ Cosine similarity for random sample of nodes
+    # 2️⃣ Random cosine similarity (all nodes)
     sample_size = min(200, num_nodes)
     idx = np.random.choice(num_nodes, sample_size, replace=False)
     cos_mat = cosine_similarity(x[idx])
     upper_tri = cos_mat[np.triu_indices(sample_size, k=1)]
-    print(f"Random cosine similarity: mean={upper_tri.mean():.4f}  std={upper_tri.std():.4f}")
+    print(f"Random cosine similarity (ALL): mean={upper_tri.mean():.4f}  std={upper_tri.std():.4f}")
 
-    # 3️⃣ Neighbor coherence
+    # 3️⃣ Neighbor coherence (all nodes)
     src, dst = edge_index.numpy()
     nb_idx = np.random.choice(len(src), min(1000, len(src)), replace=False)
     nb_sim = np.sum(x[src[nb_idx]] * x[dst[nb_idx]], axis=1) / (
         norms[src[nb_idx]] * norms[dst[nb_idx]] + 1e-9
     )
-    print(f"Neighbor cosine similarity: mean={nb_sim.mean():.4f}  std={nb_sim.std():.4f}")
+    print(f"Neighbor cosine similarity (ALL): mean={nb_sim.mean():.4f}  std={nb_sim.std():.4f}")
 
     diff = nb_sim.mean() - upper_tri.mean()
-    print(f"🔍 Neighbor > Random similarity gap: {diff:.4f} (larger is better)\n")
+    print(f"🔍 Neighbor > Random similarity gap (ALL): {diff:.4f} (larger is better)\n")
 
     # Degree statistics using networkx
     G = nx.Graph()
     G.add_edges_from(zip(src, dst))
-    degrees = [d for n, d in G.degree()]
-    print("Degree stats: min", min(degrees), "max", max(degrees), "mean", np.mean(degrees))
+    degrees = [d for _, d in G.degree()]
+    print("Degree stats (ALL): min", min(degrees), "max", max(degrees), "mean", np.mean(degrees))
+
+    # -----------------------------
+    # ✅ Review-only metrics (if node types exist in cache)
+    # -----------------------------
+    try:
+        if not os.path.exists(CACHE_PATH):
+            print("ℹ️ No graph cache found; skipping Review-only metrics.")
+            return
+
+        with open(CACHE_PATH, "rb") as f:
+            cache = pickle.load(f)
+
+        node_types = cache.get("node_types", None)
+        if not node_types:
+            print("ℹ️ node_types missing in cache; rebuild graph with --stage build to enable Review-only metrics.")
+            return
+
+        review_nodes = np.array([nid for nid, t in node_types.items() if t == "Review"], dtype=np.int64)
+        if review_nodes.size == 0:
+            print("ℹ️ No Review nodes found in node_types; skipping Review-only metrics.")
+            return
+
+        print(f"\n🧪 Review-only metrics: {review_nodes.size} nodes")
+
+        r_norms = norms[review_nodes]
+        print(f"Embedding norm (REVIEW): mean={r_norms.mean():.4f}  std={r_norms.std():.4f}")
+
+        r_sample_size = min(200, review_nodes.size)
+        r_idx = np.random.choice(review_nodes, r_sample_size, replace=False)
+        r_cos_mat = cosine_similarity(x[r_idx])
+        r_upper_tri = r_cos_mat[np.triu_indices(r_sample_size, k=1)]
+        print(f"Random cosine similarity (REVIEW): mean={r_upper_tri.mean():.4f}  std={r_upper_tri.std():.4f}")
+
+        # Neighbor coherence restricted to edges where both ends are Review nodes
+        is_review = np.zeros(num_nodes, dtype=bool)
+        is_review[review_nodes] = True
+        review_edge_mask = is_review[src] & is_review[dst]
+        src_r, dst_r = src[review_edge_mask], dst[review_edge_mask]
+
+        if src_r.size == 0:
+            print("ℹ️ No Review-Review edges found; skipping neighbor coherence (REVIEW).")
+            return
+
+        nb_r_idx = np.random.choice(src_r.size, min(1000, src_r.size), replace=False)
+        nb_r_sim = np.sum(x[src_r[nb_r_idx]] * x[dst_r[nb_r_idx]], axis=1) / (
+            norms[src_r[nb_r_idx]] * norms[dst_r[nb_r_idx]] + 1e-9
+        )
+        print(f"Neighbor cosine similarity (REVIEW): mean={nb_r_sim.mean():.4f}  std={nb_r_sim.std():.4f}")
+
+        r_diff = nb_r_sim.mean() - r_upper_tri.mean()
+        print(f"🔍 Neighbor > Random similarity gap (REVIEW): {r_diff:.4f} (larger is better)\n")
+
+    except Exception as e:
+        print(f"⚠️ Review-only metrics failed: {e}")
 # -----------------------------
 # CLI ENTRY
 # -----------------------------

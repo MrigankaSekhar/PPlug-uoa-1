@@ -24,14 +24,15 @@ class PersonalDataset:
     """
     def __init__(self, data_file, max_input_len, max_new_len, max_his_len,
                  llm_tokenizer, emb_tokenizer, graph_emb_path=None,
-                 his_to_graph_path=None, max_session_len=3):
+                 his_to_graph_path=None, max_session_len=3, max_valid_his_id=None):
 
         # Store basic configuration
         self.data_file = data_file
         self.max_input_len = max_input_len
         self.max_new_len = max_new_len
         self.max_his_len = max_his_len
-        self.max_session_len = max_session_len
+        self.max_session_len = max(max_session_len, 8)  # ✅ Enforce minimum of 8 for recency modeling
+        self.max_valid_his_id = max_valid_his_id
         self.llm_tokenizer = llm_tokenizer
         self.emb_tokenizer = emb_tokenizer
         self.graph_emb_path = graph_emb_path
@@ -44,7 +45,8 @@ class PersonalDataset:
         self.his_to_graph = {}
         if his_to_graph_path and os.path.exists(his_to_graph_path):
             try:
-                self.his_to_graph = json.load(open(his_to_graph_path))
+                with open(his_to_graph_path, "r") as f:
+                    self.his_to_graph = json.load(f)
                 print(f"📂 Loaded his_to_graph mapping ({len(self.his_to_graph)} entries)")
             except Exception as e:
                 print(f"⚠️ Could not load his_to_graph mapping: {e}")
@@ -59,18 +61,19 @@ class PersonalDataset:
 
     def normalize_his_id(self, hid):
         key = str(hid)
-        # Direct match
+
         if key in self.his_to_graph:
             return key
-        # Try with "review_" prefix
+
         review_key = f"review_{hid}"
         if review_key in self.his_to_graph:
             return review_key
-        # Try with zero-padding (if mapping keys are always 7 digits)
+
         if len(key) < 7:
             for k in self.his_to_graph.keys():
-                if k.endswith(key):
+                if isinstance(k, str) and k.endswith(key):
                     return k
+
         return None
     
     def pad_his(self, his_ids, pad_to_len=None):
@@ -111,9 +114,15 @@ class PersonalDataset:
         safe_his_ids = []
         for hid in his_id_list:
             try:
-                safe_his_ids.append(int(hid))
+                v = int(hid)
             except (TypeError, ValueError):
-                safe_his_ids.append(0)
+                v = 0
+
+            # ✅ Optional clamp: if you know memmap size, drop invalid ids
+            if self.max_valid_his_id is not None and (v < 0 or v >= self.max_valid_his_id):
+                v = 0
+
+            safe_his_ids.append(v)
         his_id_list = safe_his_ids
 
         # Optional debug for the first few samples
@@ -130,19 +139,27 @@ class PersonalDataset:
         session_ids = self.pad_his(recent_session_ids, pad_to_len=self.max_session_len)
 
         # --- Graph node IDs ---
-        # Map history IDs to graph node IDs via loaded mapping
+        # ✅ Use -1 for missing so model can mask cleanly (0 may be a real node)
         graph_node_ids_list = []
+        graph_node_mask_list = []
         for hid in his_id_list:
             norm_key = self.normalize_his_id(hid)
-            node_id = self.his_to_graph.get(norm_key, 0)
-            graph_node_ids_list.append(node_id)
-            # Debug: print if mapping is missing
-            if idx < 3 and node_id == 0:
-                print(f"[DEBUG] his_id {hid} (norm_key={norm_key}) missing in his_to_graph mapping.")
 
-        if not graph_node_ids_list:
-            graph_node_ids_list = [0]
-        graph_node_ids = torch.tensor(graph_node_ids_list, dtype=torch.long)
+            if norm_key is None:
+                node_id = -1
+            else:
+                node_id = self.his_to_graph.get(norm_key, -1)
+
+            try:
+                node_id = int(node_id)
+            except (TypeError, ValueError):
+                node_id = -1
+
+            graph_node_ids_list.append(node_id)
+            graph_node_mask_list.append(0 if node_id == -1 else 1)
+
+        graph_node_ids = self.pad_his(graph_node_ids_list, pad_to_len=self.max_his_len)
+        graph_node_mask = self.pad_his(graph_node_mask_list, pad_to_len=self.max_his_len)
 
         # --- Tokenize for LLM backbone ---
         llm_encoded = self.llm_tokenizer(
@@ -195,7 +212,8 @@ class PersonalDataset:
             "emb_token_type_ids": emb_token_type_ids,
             "his_id": his_id,
             "session_ids": session_ids,
-            "graph_node_ids": graph_node_ids
+            "graph_node_ids": graph_node_ids,
+            "graph_node_mask": graph_node_mask
         }
 
 

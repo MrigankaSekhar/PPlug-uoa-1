@@ -1,7 +1,7 @@
 #!/bin/bash
 
 task_id=3
-epoch=1
+epoch=3
 len=10
 
 # Optional: check if graph embeddings exist
@@ -23,17 +23,21 @@ python main_profile-slim-GNN.py \
     --emb_model_path ../bge-base-en-v1.5/ \
     --train_file ../LaMP_time_${task_id}_subset_id/train_aug_input.json \
     --dev_file ../LaMP_time_${task_id}_subset_id/dev_profile.json \
+    --use_profile True \
+    --use_session True \
+    --use_graph True \
     --max_input_len 256 \
     --use_subset True \
     --max_his_len 512 \
+    --max_session_len 7 \
     --max_new_len ${len} \
     --output_dir output_${task_id} \
     --optim adamw_torch \
-    --learning_rate 1e-4 \
+    --learning_rate 5e-4 \
     --weight_decay 1e-4 \
     --warmup_ratio 0.05 \
     --num_train_epochs ${epoch} \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --logging_dir ./log/ \

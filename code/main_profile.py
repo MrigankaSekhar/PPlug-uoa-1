@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import transformers
 import evaluate
 import math
+import re
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import f1_score
 
@@ -99,37 +100,46 @@ def compute_metrics_classification_acc(eval_preds) :
     result = {"accuracy" : result_acc}
     return result
 
-def compute_metrics_classification(eval_preds) :
+def compute_metrics_classification(eval_preds):
     preds, labels = eval_preds
+
     preds = [[max(0, idx) for idx in x] for x in preds]
     labels = [[max(0, idx) for idx in x] for x in labels]
-    predictions = llm_tokenizer.batch_decode(preds, skip_special_tokens=True)
-    references = llm_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    def create_mapping(x):
-        try:
-            return float(x)
-        except:
-            for z in x :
-                if (z.isnumeric()) :
-                    return float(int(z)) 
-            print(x)
-            return 1.0
+    predictions_txt = llm_tokenizer.batch_decode(preds, skip_special_tokens=True)
+    references_txt = llm_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    predictions = [create_mapping(y) for y in predictions]
-    references = [create_mapping(y) for y in references]
+    def parse_rating(s: str):
+        """
+        Extract a 1-5 integer rating from decoded text robustly.
+        Returns None if not found.
+        """
+        if s is None:
+            return None
+        m = re.search(r"\b([1-5])\b", str(s))
+        return int(m.group(1)) if m else None
 
+    # Parse
+    predictions = [parse_rating(t) for t in predictions_txt]
+    references = [parse_rating(t) for t in references_txt]
+
+    # Filter invalid pairs
+    pairs = [(p, r) for p, r in zip(predictions, references) if p is not None and r is not None]
+    if not pairs:
+        return {"mae": 0.0, "rmse": 0.0}
+
+    # Clamp to [1,5] (prevents 0 or weird values)
+    pairs = [(min(5, max(1, float(p))), min(5, max(1, float(r)))) for p, r in pairs]
 
     mae = 0.0
     rmse = 0.0
-    
-    length = len(preds)
-    for i in range(length) :
-        mae += math.fabs(predictions[i] - references[i]) / (length * 1.0)
-        rmse += (predictions[i] - references[i]) ** 2 / (length * 1.0)
+    length = len(pairs)
+
+    for p, r in pairs:
+        mae += abs(p - r) / length
+        rmse += ((p - r) ** 2) / length
 
     rmse = math.sqrt(rmse)
-
     return {"mae": mae, "rmse": rmse}
 
 

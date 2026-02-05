@@ -14,19 +14,18 @@ import torch.nn.functional as F
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 from transformers import AutoTokenizer, T5ForConditionalGeneration, AutoModel
-from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 
 # --- CONFIG ---
 TASK_ID = 3
-CHECKPOINT_NUM = 687
-PERSONA_USER_IDX = 7  # Change this to pick a different persona from your dev set
+CHECKPOINT_NUM = 1160
+PERSONA_USER_IDX = 72  # Change this to pick a different persona from your dev set
 
 # --- Paths ---
-LLM_PATH = "../FlanT5-base"
+LLM_PATH = "../FlanT5-small"
 BGE_PATH = "../bge-base-en-v1.5"
 CKPT_PATH = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
 PROFILE_PATH = "../LaMP_time_3_subset/dev_questions.json"
-IDMAP_PATH = "../bge_emb/task_3_dev_bge_idmap.json"
+OFFSETS_PATH = "../bge_emb/task_3_dev_offsets.json"
 
 # --- Load models ---
 llm_tokenizer = AutoTokenizer.from_pretrained(LLM_PATH, use_fast=False)
@@ -51,15 +50,45 @@ model.eval()
 # --- Load persona profile ---
 with open(PROFILE_PATH) as f:
     profiles = json.load(f)
-with open(IDMAP_PATH) as f:
-    his_id_to_row = json.load(f)
+with open(OFFSETS_PATH) as f:
+    offsets = json.load(f)
 
-persona_entry = profiles[PERSONA_USER_IDX]
+# Find the correct persona entry and profile history indices
+persona_entry = None
 persona_his_ids = []
-for his in persona_entry.get("profile", []):
-    row_idx = his_id_to_row.get(str(his.get("id", 0)), 0)
-    persona_his_ids.append(int(row_idx))
-his_id_real = torch.tensor(persona_his_ids, dtype=torch.long).unsqueeze(0)
+if "entries" in offsets and len(offsets["entries"]) > PERSONA_USER_IDX:
+    persona_entry = offsets["entries"][PERSONA_USER_IDX]
+    # Ensure all IDs are integers (not strings)
+    persona_his_ids = [int(hid) for hid in persona_entry.get("profile_id", []) if str(hid).isdigit()]
+else:
+    print(f"Warning: PERSONA_USER_IDX {PERSONA_USER_IDX} out of range in offsets file.")
+    persona_entry = profiles[PERSONA_USER_IDX]
+    persona_his_ids = [int(his.get("id", 0)) for his in persona_entry.get("profile", []) if str(his.get("id", 0)).isdigit()]
+
+# --- PATCH: Map profile IDs to valid memmap row indices ---
+# Load offsets mapping for dev set
+with open(OFFSETS_PATH, "r") as f:
+    offsets_data = json.load(f)
+
+# Build mapping from profile_id to row index
+profile_id_to_row = {}
+for entry_ in offsets_data.get("entries", []):
+    for idx, pid in enumerate(entry_.get("profile_id", [])):
+        # The row index is entry_["start"] + idx
+        profile_id_to_row[str(pid)] = entry_.get("start", 0) + idx
+
+# Map persona_his_ids to valid row indices (default to 0 if not found)
+persona_row_indices = [profile_id_to_row.get(str(pid), 0) for pid in persona_his_ids]
+
+his_id_real = torch.tensor(persona_row_indices, dtype=torch.long).unsqueeze(0)
+MAX_HIS_LEN = 10
+if his_id_real.shape[1] < MAX_HIS_LEN:
+    # Pad to MAX_HIS_LEN
+    pad_len = MAX_HIS_LEN - his_id_real.shape[1]
+    his_id_real = torch.cat([his_id_real, torch.zeros((1, pad_len), dtype=torch.long)], dim=1)
+elif his_id_real.shape[1] > MAX_HIS_LEN:
+    his_id_real = his_id_real[:, :MAX_HIS_LEN]
+his_id_empty = torch.zeros_like(his_id_real)
 
 # Load graph cache for node info (if available)
 import pickle
@@ -75,17 +104,13 @@ else:
     his_to_graph = {}
 
 print(f"\n=== User {PERSONA_USER_IDX} Profile (Graph Diagnostics) ===")
-profile_list = persona_entry.get("profile", [])
+profile_list = profiles[PERSONA_USER_IDX].get("profile", [])
 if profile_list:
     for i, his in enumerate(profile_list):
         hid = str(his.get("id", 0))
         graph_node_id = his_to_graph.get(hid, None)
         review_text = his.get("text", "(no text)")
         node_text = node_texts.get(graph_node_id, "(no graph text)") if graph_node_id is not None else "(no graph node)"
-        # Try to extract sentiment/popularity from node_text (if present)
-        sentiment = None
-        popularity = None
-        # You can add logic here if you want to parse node_text for sentiment/popularity
         print(f"  [{i}] Review ID: {hid} | Graph Node: {graph_node_id} | Text: {review_text[:80]}...")
         print(f"       Graph Node Text: {node_text[:80]}...")
 else:
@@ -94,22 +119,28 @@ print("="*60)
 
 # --- List of unknown questions ---
 unknown_questions = [
-    "What is the score of the following review on a scale of 1 to 5? review: This product exceeded my expectations and works flawlessly.",
-    "How would you rate the following? review: The book was a bit slow and not very engaging.",
-    "Give a rating for this: review: The headphones are comfortable but the sound quality is average.",
-    "Rate this review: The service was terrible and I would not recommend this place.",
-    "What score would you give? review: The movie was fun, but the ending was predictable.",
-]
+    # Direct rating prediction (best supported)
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5. review: The battery life is disappointing and the screen is hard to read outdoors.",
+    "What is the score of the following review on a scale of 1 to 5? just answer with 1, 2, 3, 4, or 5. review: Excellent build quality and fast shipping. Highly recommended!",
 
-graph_questions = [
-    "Based on their profile history, which does this user prefer: 'Electronics' or 'Books'?",
-    "Given users with similar review history, what rating would this user likely give to this item?",
-    "Would this user purchase this item? Answer yes or no. Review: Durable and matches previous purchases.",
-    "Is the sentiment of this review similar to those the user has written before?",
+    # Sentiment-based
+    "Does this user tend to rate positive reviews higher than negative ones?",
+    "Is the sentiment of this review similar to those the user has written before? review: The product was easy to use and worked as expected.",
+
+    # Popularity-based
     "Does this user tend to rate popular items higher than less popular ones?",
-]
+    "Would this user give a higher score to a high-popularity item? review: This is a best-selling item with many positive reviews.",
 
-unknown_questions += graph_questions
+    # Category preference (if your graph encodes categories)
+    "Based on their profile history, which does this user prefer: 'Electronics' or 'Books'?",
+    "Given the user's history in 'Outdoor Gear', how likely (1-5) to rate this item positively? review: Waterproof tent with easy setup.",
+
+    # Purchase likelihood
+    "Would this user purchase this item? Answer yes or no. Review: Durable and matches previous purchases.",
+
+    # Review similarity
+    "Is the following review similar to those the user has written before? review: The interface is intuitive and the design is sleek.",
+]
 
 print(f"\n=== Comparing outputs for {len(unknown_questions)} unknown questions ===\n")
 

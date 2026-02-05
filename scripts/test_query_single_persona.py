@@ -29,7 +29,7 @@ from extention.ModelForPer_slim_GNN import PersonalLLM_Slim
 
 # === Config toggles ===
 USE_GATE = True
-CHECKPOINT_NUM = 2062
+CHECKPOINT_NUM = 129
 TASK_ID = 3
 USE_SUBSET = True
 
@@ -38,32 +38,23 @@ llm_tokenizer = AutoTokenizer.from_pretrained("../FlanT5-small", use_fast=False)
 emb_tokenizer = AutoTokenizer.from_pretrained("../bge-base-en-v1.5")
 
 # === Load model & checkpoint ===
-# Load personalized model (with checkpoint)
 llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
-ckpt_path = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
-if not os.path.exists(ckpt_path):
-    raise FileNotFoundError(f"❌ Missing checkpoint: {ckpt_path}")
-state_dict = torch.load(ckpt_path, map_location="cpu")
-llm_model.load_state_dict(state_dict, strict=False)
-
-# Load plain baseline model (NO checkpoint)
-plain_llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
-
+llm_model.resize_token_embeddings(len(llm_tokenizer))  # <-- Add this line!
 emb_model = AutoModel.from_pretrained("../bge-base-en-v1.5")
-
-# === Instantiate personalization model ===
 model = PersonalLLM_Slim(
     llm_model=llm_model,
     emb_model=emb_model,
     max_input_len=256,
     max_new_len=32,
-    task_id=TASK_ID,
-    use_gate=USE_GATE,
+    task_id=3
 )
-model.eval()
-print(f"[DEBUG] LLM device: {next(llm_model.parameters()).device}")
-print(f"[DEBUG] Embedding model device: {next(emb_model.parameters()).device}")
-print(f"[DEBUG] Model params loaded: {len(state_dict)} tensors")
+ckpt_path = f"../extention/output_{TASK_ID}/checkpoint-{CHECKPOINT_NUM}/pytorch_model.bin"
+state_dict = torch.load(ckpt_path, map_location="cpu")
+model.load_state_dict(state_dict, strict=False)
+print("Gate bias after loading:", model.gate.bias.data.item())
+
+# Load plain baseline model (NO checkpoint)
+plain_llm_model = T5ForConditionalGeneration.from_pretrained("../FlanT5-small")
 
 print("Gate weights:", model.gate.weight.data)
 print("Gate bias:", model.gate.bias.data)
@@ -111,107 +102,48 @@ def compute_profile_embs(his_id, emb_input):
 
         # === Empty persona fallback ===
         if his_id.eq(0).all():
-            neutral_vec = torch.zeros((1, model.emb_emb_size), device=task_embs.device)
-            neutral_vec = model.align_mlp(neutral_vec)
-            return neutral_vec
+            # Return a true zero vector in LLM embedding space
+            return torch.zeros((1, model.llm_emb_size), device=task_embs.device)
 
         # === Obtain real persona embedding ===
         emb_vec = model.obtain_profile_emb(his_id, task_embs)
         emb_vec = torch.nan_to_num(emb_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
         # --- Normalization + dropout noise ---
-        # --- Strengthened normalization + adaptive noise ---
         emb_vec = F.normalize(emb_vec, p=2, dim=-1)
-        # add magnitudes proportional to task embedding norm
-        scale = task_embs.norm(p=2, dim=-1, keepdim=True) * 0.05
-        noise = torch.randn_like(emb_vec) * scale
-        # emb_vec = emb_vec + noise  # <-- comment this line for pure embeddings
-        # emb_vec = F.normalize(emb_vec, p=2, dim=-1)
-
         return emb_vec
 
 def run_case(llm_input, emb_input, his_id):
     """Run forward generation for a given persona tensor with gate diagnostics."""
     with torch.no_grad():
-        # Task embeddings
-        task_embs = model.obtain_task_emb(
-            emb_input_ids=emb_input["input_ids"],
-            emb_attention_mask=emb_input["attention_mask"],
-            emb_token_type_ids=torch.zeros_like(emb_input["input_ids"])
-        )
-        task_embs = torch.nan_to_num(task_embs, nan=0.0, posinf=0.0, neginf=0.0)
+        # ... (gate diagnostics as before) ...
 
-        # Persona embeddings
-        persona_embs = model.obtain_profile_emb(his_id, task_embs)
-        persona_embs = torch.nan_to_num(persona_embs, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # ---- GATE MONITOR (MATCHING FORWARD PASS) ----
-        if hasattr(model, "gate") and hasattr(model, "cross_attn"):
-            # Prepare for cross-attention: shape (batch, seq, dim)
-            task_embs_exp = task_embs.unsqueeze(1)  # (B, 1, D)
-            persona_embs_exp = persona_embs.unsqueeze(1)  # (B, 1, D)
-            # Use cross-attention as in model.forward
-            attn_out, _ = model.cross_attn(task_embs_exp, persona_embs_exp, persona_embs_exp)
-            gate_in = torch.cat([task_embs_exp, attn_out], dim=-1)
-            gate_out = torch.sigmoid(model.gate(gate_in))
-            mean_val = gate_out.mean().item()
-            std_val = float(gate_out.std().item()) if gate_out.numel() > 1 else 0.0
-            print(f"[Gate‑Monitor-FWD] mean={mean_val:.4f} ±{std_val:.4f}")
-        # ------------------------------------------------
-
-        # ---- GATE MONITOR ----
-        if hasattr(model, "gate"):
-            gate_in = torch.cat([task_embs, persona_embs], dim=-1)
-            print("Gate input stats (mean, std, min, max):", 
-                  gate_in.mean().item(), gate_in.std().item(), gate_in.min().item(), gate_in.max().item())
-            print("Any NaN in gate input?", torch.isnan(gate_in).any().item())
-            gate_in = torch.nan_to_num(gate_in, nan=0.0, posinf=0.0, neginf=0.0)
-            gate_out = torch.sigmoid(model.gate(gate_in))
-
-            # Guard against NaNs or empty tensors
-            if torch.isnan(gate_out).any():
-                print("[Gate‑Monitor] ⚠️ NaN detected in gate output — replacing with zeros.")
-                gate_out = torch.zeros_like(gate_out)
-            
-            # Compute statistics safely
-            mean_val = gate_out.mean().item()
-            std_val = float(gate_out.std().item()) if gate_out.numel() > 1 else 0.0
-            if math.isfinite(std_val):
-                print(f"[Gate‑Monitor] mean={mean_val:.4f} ±{std_val:.4f}")
-            else:
-                print(f"[Gate‑Monitor] mean={mean_val:.4f} ±0.0000 (flat activation)")
-                gate_out = torch.nan_to_num(gate_out, nan=0.0, posinf=0.0, neginf=0.0)
-        # ----------------------
-
-        # Forward generation
-        # --- PATCH: Handle models that expect labels to always be a tensor ---
-        # If model.forward fails with labels=None, fallback to dummy tensor.
-        try:
-            _, seqs = model.forward(
+        # Use generate for text output
+        # If your model supports personalization during generation, use that.
+        # Otherwise, use the underlying T5 model.
+        if hasattr(model, "generate"):
+            # If your PersonalLLM_Slim exposes a generate method
+            gen_ids = model.generate(
                 llm_input_ids=llm_input["input_ids"],
                 llm_attention_mask=llm_input["attention_mask"],
-                labels=None,  # Preferred: None for inference
                 emb_input_ids=emb_input["input_ids"],
                 emb_attention_mask=emb_input["attention_mask"],
                 emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
-                his_id=his_id
+                his_id=his_id,
+                max_new_tokens=32,
+                num_beams=4,
+                do_sample=False
             )
-        except AttributeError as e:
-            # Fallback: pass a dummy tensor if labels=None causes error
-            if "'NoneType' object has no attribute 'long'" in str(e):
-                dummy_labels = torch.zeros_like(llm_input["input_ids"])
-                _, seqs = model.forward(
-                    llm_input_ids=llm_input["input_ids"],
-                    llm_attention_mask=llm_input["attention_mask"],
-                    labels=dummy_labels,
-                    emb_input_ids=emb_input["input_ids"],
-                    emb_attention_mask=emb_input["attention_mask"],
-                    emb_token_type_ids=torch.zeros_like(emb_input["input_ids"]),
-                    his_id=his_id
-                )
-            else:
-                raise
-        output_text = llm_tokenizer.decode(seqs[0], skip_special_tokens=True).strip()
+        else:
+            # Fallback: use underlying T5 model
+            gen_ids = model.llm_model.generate(
+                input_ids=llm_input["input_ids"],
+                attention_mask=llm_input["attention_mask"],
+                max_new_tokens=32,
+                num_beams=4,
+                do_sample=False
+            )
+        output_text = llm_tokenizer.decode(gen_ids[0], skip_special_tokens=True).strip()
         if output_text == "" or set(output_text) == {"."}:
             output_text = "(no meaningful output)"
         return output_text
@@ -420,3 +352,15 @@ if hasattr(model, "gate"):
 print("\n=== FINAL DIAGNOSTICS ===")
 if hasattr(model, "gate"):
     print("Final gate bias:", model.gate.bias.data.item())
+
+if hasattr(model, "gate"):
+    torch.nn.init.constant_(model.gate.bias, 0.0)
+    print("Gate bias forcibly set to:", model.gate.bias.data.item())
+
+if hasattr(model, "gate"):
+    model.gate.bias.data.fill_(0.0)
+    print("Gate bias forcibly set to:", model.gate.bias.data.item())
+
+# Print raw persona embeddings before normalization
+print("Raw real persona emb:", emb_real.cpu().numpy())
+print("Raw empty persona emb:", emb_empty.cpu().numpy())

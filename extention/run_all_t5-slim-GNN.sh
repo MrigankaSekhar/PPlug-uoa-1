@@ -15,6 +15,10 @@ deepspeed --master_port=29501 main_profile-slim-GNN.py \
     --emb_model_path ../bge-base-en-v1.5/ \
     --train_file ../LaMP_time_${task_id}_id/train_aug_input.json \
     --dev_file ../LaMP_time_${task_id}_id/dev_profile.json \
+    --use_profile True \
+    --use_session False \
+    --use_graph False \
+    --use_inst_token False \
     --use_4bit True \
     --use_8bit False \
     --max_input_len 256 \
